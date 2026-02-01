@@ -6,7 +6,13 @@
       "WebFetch(domain:antran.app)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(npm install:*)",
-      "Bash(del /f e:TestPoxyclaudePoXYsrcclaudeProcessPool.ts)"
+      "Bash(del /f e:TestPoxyclaudePoXYsrcclaudeProcessPool.ts)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run auth:*)",
+      "Bash(if [ -f .env ])",
+      "Bash(then)",
+      "Bash(else)",
+      "Bash(fi)"
     ]
   }
 }

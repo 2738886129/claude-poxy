@@ -6,6 +6,7 @@ import { join } from 'path';
 import { createWebProxy } from './webProxy.js';
 import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
+import { createAuthMiddleware, validateApiKey, getLoginPageHtml, isAuthEnabled, getKeyExpiresMs } from './auth.js';
 
 // 读取配置文件
 function loadConfig(): { allowedChats: string[]; allowedProjects: string[] } {
@@ -45,11 +46,53 @@ checkClaudeLogin();
 
 const app = express();
 
+// ===== 认证相关路由（必须在代理之前） =====
+
+// 登录页面
+app.get('/__proxy__/login', (req, res) => {
+  const error = req.query.error as string | undefined;
+  res.type('html').send(getLoginPageHtml(error));
+});
+
+// 处理登录表单提交
+app.use('/__proxy__/login', express.urlencoded({ extended: false }));
+app.post('/__proxy__/login', (req, res) => {
+  const apiKey = req.body.api_key;
+
+  if (!apiKey) {
+    return res.redirect('/__proxy__/login?error=invalid');
+  }
+
+  const keyEntry = validateApiKey(apiKey);
+  if (!keyEntry) {
+    return res.redirect('/__proxy__/login?error=invalid');
+  }
+
+  // 设置 Cookie，使用 Key 配置的有效期
+  const maxAge = getKeyExpiresMs(keyEntry);
+  res.cookie('proxy_key', apiKey, {
+    maxAge,
+    httpOnly: true,
+    sameSite: 'lax'
+  });
+
+  const days = keyEntry.expiresInDays || 7;
+  console.log(`[Auth] 用户登录成功: ${keyEntry.name}, Cookie 有效期: ${days} 天`);
+  res.redirect('/');
+});
+
+// 登出
+app.get('/__proxy__/logout', (_req, res) => {
+  res.clearCookie('proxy_key');
+  res.redirect('/__proxy__/login');
+});
+
 // Web 代理必须在 express.json() 之前挂载
 // 否则 POST 请求的 body 会被消费，导致代理无法正确转发
 if (SESSION_KEY) {
   // 创建一次代理实例并复用，避免内存泄漏警告
   const webProxy = createWebProxy(SESSION_KEY);
+  const authMiddleware = createAuthMiddleware();
 
   // 排除 CLI API 路径和内部路径
   app.use((req, res, next) => {
@@ -58,54 +101,707 @@ if (SESSION_KEY) {
     if (path.startsWith('/v1/') || path.startsWith('/__proxy__/')) {
       return next();
     }
-    // 其他路径走 Web 代理
-    return webProxy(req, res, next);
+
+    // 拦截第三方服务请求（Sentry 错误上报、Intercom 客服等）
+    // 这些服务对 Claude 核心功能无影响，拦截可减少控制台噪音
+    const blockedDomains = [
+      'sentry.io',           // Sentry 错误追踪
+      'api-iam.intercom.io', // Intercom 客服聊天
+      'intercom.io'          // Intercom 相关
+    ];
+
+    const referer = req.get('referer') || '';
+    const host = req.get('host') || '';
+
+    // 检查是否是到被阻止域名的请求
+    if (blockedDomains.some(domain =>
+        referer.includes(domain) ||
+        host.includes(domain) ||
+        path.includes(domain)
+    )) {
+      // 返回空响应，避免控制台错误
+      return res.status(204).end();
+    }
+
+    // 先验证认证，再走 Web 代理
+    authMiddleware(req, res, (err?: any) => {
+      if (err) return next(err);
+      return webProxy(req, res, next);
+    });
   });
 }
 
 // 提供自定义注入脚本
 app.get('/__proxy__/inject.js', (_req, res) => {
+  // 禁用缓存，确保每次都获取最新脚本
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.type('application/javascript').send(`
     (function() {
-      // 项目和聊天过滤已移到 API 层，此脚本只负责隐藏 UI 元素
+      // ========== 浏览器指纹伪装（调试模式：暂时禁用） ==========
+      // 如果遇到 Claude 阻止访问，可以临时注释掉指纹伪装，只保留 UI 隐藏
+      const ENABLE_FINGERPRINT_SPOOFING = true; // 设为 false 禁用指纹伪装
 
-      // 使用 CSS 注入
-      const style = document.createElement('style');
-      style.id = 'proxy-hide-styles';
-      style.textContent = \`
-        /* 隐藏用户菜单按钮 */
-        [data-testid="user-menu-button"],
-        [data-testid="user-menu-button"]:parent {
-          display: none !important;
-        }
-        /* 隐藏用户菜单容器 */
-        .border-t-0\\.5.border-border-300 {
-          display: none !important;
-        }
-        /* 隐藏 Artifacts 导航项 */
-        a[href="/artifacts"],
-        a[href="/artifacts"]:parent {
-          display: none !important;
-        }
-        .relative.group:has(a[href="/artifacts"]) {
-          display: none !important;
-        }
-        /* 隐藏 Code 导航项 */
-        a[href="/code"],
-        a[href="/code"]:parent {
-          display: none !important;
-        }
-        .relative.group:has(a[href="/code"]) {
-          display: none !important;
-        }
-      \`;
+      if (ENABLE_FINGERPRINT_SPOOFING) {
+      // ========== 浏览器指纹伪装 ==========
+      // 伪装的浏览器信息 - 与服务端 HTTP 头保持一致
+      const SPOOFED = {
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        platform: 'Win32',
+        language: 'en-US',
+        languages: ['en-US', 'en'],
+        hardwareConcurrency: 8,
+        deviceMemory: 8,
+        maxTouchPoints: 0,
+        vendor: 'Google Inc.',
+        appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        // 屏幕信息
+        screenWidth: 1920,
+        screenHeight: 1080,
+        screenColorDepth: 24,
+        screenPixelDepth: 24,
+        // 时区
+        timezoneOffset: -480,
+        timezone: 'Asia/Shanghai'
+      };
 
-      if (!document.getElementById('proxy-hide-styles')) {
-        document.head.appendChild(style);
+      // 伪装 navigator 属性
+      const navigatorProps = {
+        userAgent: { get: () => SPOOFED.userAgent },
+        platform: { get: () => SPOOFED.platform },
+        language: { get: () => SPOOFED.language },
+        languages: { get: () => Object.freeze([...SPOOFED.languages]) },
+        hardwareConcurrency: { get: () => SPOOFED.hardwareConcurrency },
+        deviceMemory: { get: () => SPOOFED.deviceMemory },
+        maxTouchPoints: { get: () => SPOOFED.maxTouchPoints },
+        vendor: { get: () => SPOOFED.vendor },
+        appVersion: { get: () => SPOOFED.appVersion },
+        webdriver: { get: () => false }
+      };
+
+      for (const [prop, descriptor] of Object.entries(navigatorProps)) {
+        try {
+          Object.defineProperty(navigator, prop, { ...descriptor, configurable: true });
+        } catch (e) {}
       }
 
+      // 伪装 screen 属性
+      const screenProps = {
+        width: { get: () => SPOOFED.screenWidth },
+        height: { get: () => SPOOFED.screenHeight },
+        availWidth: { get: () => SPOOFED.screenWidth },
+        availHeight: { get: () => SPOOFED.screenHeight - 40 },
+        colorDepth: { get: () => SPOOFED.screenColorDepth },
+        pixelDepth: { get: () => SPOOFED.screenPixelDepth }
+      };
+
+      for (const [prop, descriptor] of Object.entries(screenProps)) {
+        try {
+          Object.defineProperty(screen, prop, { ...descriptor, configurable: true });
+        } catch (e) {}
+      }
+
+      // 伪装 screen.orientation
+      try {
+        Object.defineProperty(screen, 'orientation', {
+          get: () => ({
+            type: 'landscape-primary',
+            angle: 0,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => true,
+            lock: () => Promise.resolve(),
+            unlock: () => {}
+          }),
+          configurable: true
+        });
+      } catch (e) {}
+
+      // 伪装 window.matchMedia
+      try {
+        const originalMatchMedia = window.matchMedia;
+        window.matchMedia = function(query) {
+          const result = originalMatchMedia.call(window, query);
+          // 对于可能泄露信息的查询，返回统一值
+          if (query.includes('prefers-color-scheme')) {
+            return {
+              matches: false, // 假装不是暗色模式
+              media: query,
+              addEventListener: result.addEventListener.bind(result),
+              removeEventListener: result.removeEventListener.bind(result),
+              addListener: result.addListener ? result.addListener.bind(result) : () => {},
+              removeListener: result.removeListener ? result.removeListener.bind(result) : () => {},
+              dispatchEvent: result.dispatchEvent.bind(result),
+              onchange: null
+            };
+          }
+          if (query.includes('prefers-reduced-motion')) {
+            return {
+              matches: false,
+              media: query,
+              addEventListener: result.addEventListener.bind(result),
+              removeEventListener: result.removeEventListener.bind(result),
+              addListener: result.addListener ? result.addListener.bind(result) : () => {},
+              removeListener: result.removeListener ? result.removeListener.bind(result) : () => {},
+              dispatchEvent: result.dispatchEvent.bind(result),
+              onchange: null
+            };
+          }
+          return result;
+        };
+      } catch (e) {}
+
+      // 伪装时区
+      const originalDateTimeFormat = Intl.DateTimeFormat;
+      Intl.DateTimeFormat = function(...args) {
+        const instance = new originalDateTimeFormat(...args);
+        const originalResolvedOptions = instance.resolvedOptions.bind(instance);
+        instance.resolvedOptions = function() {
+          const options = originalResolvedOptions();
+          options.timeZone = SPOOFED.timezone;
+          return options;
+        };
+        return instance;
+      };
+      // 关键：保留原型和静态方法
+      Intl.DateTimeFormat.prototype = originalDateTimeFormat.prototype;
+      Intl.DateTimeFormat.supportedLocalesOf = originalDateTimeFormat.supportedLocalesOf;
+      // 复制所有其他静态属性
+      Object.keys(originalDateTimeFormat).forEach(key => {
+        if (key !== 'prototype' && key !== 'supportedLocalesOf') {
+          try {
+            Intl.DateTimeFormat[key] = originalDateTimeFormat[key];
+          } catch (e) {}
+        }
+      });
+
+      Date.prototype.getTimezoneOffset = function() {
+        return SPOOFED.timezoneOffset;
+      };
+
+      // 伪装 window 尺寸 (与 screen 保持一致)
+      try {
+        Object.defineProperty(window, 'innerWidth', { get: () => SPOOFED.screenWidth, configurable: true });
+        Object.defineProperty(window, 'innerHeight', { get: () => SPOOFED.screenHeight - 100, configurable: true });
+        Object.defineProperty(window, 'outerWidth', { get: () => SPOOFED.screenWidth, configurable: true });
+        Object.defineProperty(window, 'outerHeight', { get: () => SPOOFED.screenHeight, configurable: true });
+        Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true });
+        // documentElement 可能还不存在，延迟处理
+        if (document.documentElement) {
+          Object.defineProperty(document.documentElement, 'clientWidth', { get: () => SPOOFED.screenWidth, configurable: true });
+          Object.defineProperty(document.documentElement, 'clientHeight', { get: () => SPOOFED.screenHeight - 100, configurable: true });
+        }
+      } catch (e) {}
+
+      // 伪装 navigator.doNotTrack
+      try {
+        Object.defineProperty(navigator, 'doNotTrack', { get: () => '1', configurable: true });
+      } catch (e) {}
+
+      // 伪装 navigator.userAgentData (User-Agent Client Hints API)
+      try {
+        const spoofedUserAgentData = {
+          brands: [
+            { brand: 'Not_A Brand', version: '8' },
+            { brand: 'Chromium', version: '120' },
+            { brand: 'Google Chrome', version: '120' }
+          ],
+          mobile: false,
+          platform: 'Windows',
+          getHighEntropyValues: (hints) => Promise.resolve({
+            brands: spoofedUserAgentData.brands,
+            mobile: false,
+            platform: 'Windows',
+            platformVersion: '10.0.0',
+            architecture: 'x86',
+            bitness: '64',
+            model: '',
+            uaFullVersion: '120.0.0.0',
+            fullVersionList: spoofedUserAgentData.brands.map(b => ({ ...b }))
+          })
+        };
+        Object.defineProperty(navigator, 'userAgentData', {
+          get: () => spoofedUserAgentData,
+          configurable: true
+        });
+      } catch (e) {}
+
+      // 伪装 WebGL 指纹 (必须在 Canvas 之前定义，因为 Canvas 会引用)
+      const SPOOFED_WEBGL = {
+        vendor: 'Google Inc. (NVIDIA)',
+        renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+        extensions: [
+          'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float',
+          'EXT_float_blend', 'EXT_frag_depth', 'EXT_shader_texture_lod',
+          'EXT_texture_filter_anisotropic', 'OES_element_index_uint', 'OES_fbo_render_mipmap',
+          'OES_standard_derivatives', 'OES_texture_float', 'OES_texture_float_linear',
+          'OES_texture_half_float', 'OES_texture_half_float_linear', 'OES_vertex_array_object',
+          'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_s3tc', 'WEBGL_debug_renderer_info',
+          'WEBGL_debug_shaders', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'
+        ]
+      };
+
+      // 保存原始 getContext (Canvas 伪装需要引用)
+      const originalGetContext = HTMLCanvasElement.prototype.getContext;
+
+      // 伪装 Canvas 指纹 - 使用噪点注入而非修改原始数据
+      const canvasNoiseSeed = 12345;
+      const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+
+      HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+        // 只对指纹检测用的小 canvas 添加噪点，且只处理 2d canvas
+        if (this.width <= 300 && this.height <= 150) {
+          try {
+            const existingContext = this.__existingContextType__;
+            if (!existingContext || existingContext === '2d') {
+              const ctx = originalGetContext.call(this, '2d');
+              if (ctx) {
+                const imageData = ctx.getImageData(0, 0, this.width, this.height);
+                for (let i = 0; i < Math.min(10, imageData.data.length); i += 4) {
+                  imageData.data[i] = (imageData.data[i] + canvasNoiseSeed % 3) % 256;
+                }
+                ctx.putImageData(imageData, 0, 0);
+              }
+            }
+          } catch (e) {}
+        }
+        return originalToDataURL.call(this, type, quality);
+      };
+
+      // 伪装 toBlob (另一种 Canvas 指纹收集方式)
+      HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+        if (this.width <= 300 && this.height <= 150) {
+          try {
+            const existingContext = this.__existingContextType__;
+            if (!existingContext || existingContext === '2d') {
+              const ctx = originalGetContext.call(this, '2d');
+              if (ctx) {
+                const imageData = ctx.getImageData(0, 0, this.width, this.height);
+                for (let i = 0; i < Math.min(10, imageData.data.length); i += 4) {
+                  imageData.data[i] = (imageData.data[i] + canvasNoiseSeed % 3) % 256;
+                }
+                ctx.putImageData(imageData, 0, 0);
+              }
+            }
+          } catch (e) {}
+        }
+        return originalToBlob.call(this, callback, type, quality);
+      };
+
+      // 伪装 getContext
+      HTMLCanvasElement.prototype.getContext = function(type, attributes) {
+        const context = originalGetContext.call(this, type, attributes);
+        // 记录 context 类型，避免冲突
+        this.__existingContextType__ = type;
+
+        if (context && (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl')) {
+          // 伪装 getParameter
+          const originalGetParameter = context.getParameter.bind(context);
+          context.getParameter = function(param) {
+            if (param === 37445) return SPOOFED_WEBGL.vendor;
+            if (param === 37446) return SPOOFED_WEBGL.renderer;
+            return originalGetParameter(param);
+          };
+
+          // 伪装 getSupportedExtensions
+          context.getSupportedExtensions = function() {
+            return [...SPOOFED_WEBGL.extensions];
+          };
+
+          // 伪装 getExtension
+          const originalGetExtension = context.getExtension.bind(context);
+          context.getExtension = function(name) {
+            if (name === 'WEBGL_debug_renderer_info') {
+              return { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
+            }
+            return originalGetExtension(name);
+          };
+        }
+        return context;
+      };
+
+      // 伪装 AudioContext 指纹
+      if (window.AudioContext || window.webkitAudioContext) {
+        const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+        window.AudioContext = window.webkitAudioContext = function(...args) {
+          const context = new OriginalAudioContext(...args);
+          const originalCreateOscillator = context.createOscillator.bind(context);
+          context.createOscillator = function() {
+            const oscillator = originalCreateOscillator();
+            const originalFrequency = oscillator.frequency;
+            Object.defineProperty(oscillator, 'frequency', {
+              get: () => originalFrequency,
+              configurable: true
+            });
+            return oscillator;
+          };
+          return context;
+        };
+      }
+
+      // 伪装 ClientRects 指纹
+      const originalGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect = function() {
+        const rect = originalGetBoundingClientRect.call(this);
+        // 创建一个类似 DOMRect 的对象，保持原型链
+        const roundedRect = {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          top: Math.round(rect.top),
+          right: Math.round(rect.right),
+          bottom: Math.round(rect.bottom),
+          left: Math.round(rect.left),
+          toJSON: function() {
+            return { x: this.x, y: this.y, width: this.width, height: this.height,
+                     top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+          }
+        };
+        // 尝试设置原型为 DOMRect，如果失败则返回普通对象
+        try {
+          Object.setPrototypeOf(roundedRect, DOMRect.prototype);
+        } catch (e) {}
+        return roundedRect;
+      };
+
+      // 伪装 Plugins 和 MimeTypes
+      try {
+        const createPluginArray = () => {
+          const arr = [];
+          Object.defineProperty(arr, 'length', { value: 0, writable: false });
+          arr.item = (index) => null;
+          arr.namedItem = (name) => null;
+          arr.refresh = () => {};
+          return arr;
+        };
+
+        const createMimeTypeArray = () => {
+          const arr = [];
+          Object.defineProperty(arr, 'length', { value: 0, writable: false });
+          arr.item = (index) => null;
+          arr.namedItem = (name) => null;
+          return arr;
+        };
+
+        Object.defineProperty(navigator, 'plugins', {
+          get: createPluginArray,
+          configurable: true
+        });
+
+        Object.defineProperty(navigator, 'mimeTypes', {
+          get: createMimeTypeArray,
+          configurable: true
+        });
+
+        // 伪装 navigator.pdfViewerEnabled (Chrome 120+)
+        Object.defineProperty(navigator, 'pdfViewerEnabled', {
+          get: () => true,
+          configurable: true
+        });
+      } catch (e) {}
+
+      // 隐藏自动化检测标志 (保留 window.chrome，因为真实 Chrome 有这个对象)
+      try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        // 如果不存在 window.chrome，伪装一个基本的
+        if (!window.chrome) {
+          window.chrome = { runtime: {} };
+        }
+      } catch (e) {}
+
+      // 伪装 navigator.connection (网络信息 API)
+      try {
+        Object.defineProperty(navigator, 'connection', {
+          get: () => ({
+            effectiveType: '4g',
+            rtt: 50,
+            downlink: 10,
+            saveData: false
+          }),
+          configurable: true
+        });
+      } catch (e) {}
+
+      // 伪装 navigator.getBattery (电池 API)
+      try {
+        navigator.getBattery = () => Promise.resolve({
+          charging: true,
+          chargingTime: 0,
+          dischargingTime: Infinity,
+          level: 1,
+          addEventListener: () => {},
+          removeEventListener: () => {}
+        });
+      } catch (e) {}
+
+      // 伪装 Performance API
+      try {
+        // 降低时间精度，防止时序攻击指纹
+        const originalNow = Performance.prototype.now;
+        Performance.prototype.now = function() {
+          return Math.round(originalNow.call(this) * 10) / 10; // 精度降到 0.1ms
+        };
+
+        // 伪装 performance.memory (仅 Chrome)
+        if (performance.memory) {
+          Object.defineProperty(performance, 'memory', {
+            get: () => ({
+              jsHeapSizeLimit: 2172649472,
+              totalJSHeapSize: 50000000,
+              usedJSHeapSize: 40000000
+            }),
+            configurable: true
+          });
+        }
+      } catch (e) {}
+
+      // 伪装 navigator.mediaDevices (防止枚举摄像头/麦克风)
+      try {
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+          navigator.mediaDevices.enumerateDevices = () => Promise.resolve([]);
+        }
+      } catch (e) {}
+
+      // 伪装 speechSynthesis.getVoices (语音合成指纹)
+      try {
+        if (window.speechSynthesis) {
+          window.speechSynthesis.getVoices = () => [];
+        }
+      } catch (e) {}
+
+      // 伪装 OffscreenCanvas (如果存在)
+      try {
+        if (typeof OffscreenCanvas !== 'undefined') {
+          const originalOffscreenGetContext = OffscreenCanvas.prototype.getContext;
+          OffscreenCanvas.prototype.getContext = function(type, attributes) {
+            const context = originalOffscreenGetContext.call(this, type, attributes);
+            if (context && (type === 'webgl' || type === 'webgl2')) {
+              const origGetParam = context.getParameter.bind(context);
+              context.getParameter = function(param) {
+                if (param === 37445) return SPOOFED_WEBGL.vendor;
+                if (param === 37446) return SPOOFED_WEBGL.renderer;
+                return origGetParam(param);
+              };
+            }
+            return context;
+          };
+        }
+      } catch (e) {}
+
+      // 伪装字体检测 - 通过标准化元素尺寸测量
+      try {
+        const originalOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
+        const originalOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+
+        if (originalOffsetWidth && originalOffsetHeight) {
+          // 对用于字体检测的小元素返回标准化尺寸
+          Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+            get: function() {
+              const width = originalOffsetWidth.get.call(this);
+              // 字体检测通常使用很小的测试元素
+              if (this.style && this.style.position === 'absolute' &&
+                  this.style.left === '-9999px' && width < 500) {
+                return Math.round(width / 10) * 10; // 四舍五入到10的倍数
+              }
+              return width;
+            },
+            configurable: true
+          });
+
+          Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+            get: function() {
+              const height = originalOffsetHeight.get.call(this);
+              if (this.style && this.style.position === 'absolute' &&
+                  this.style.left === '-9999px' && height < 500) {
+                return Math.round(height / 10) * 10;
+              }
+              return height;
+            },
+            configurable: true
+          });
+        }
+      } catch (e) {}
+
+      } // 结束 if (ENABLE_FINGERPRINT_SPOOFING)
+
+      // ========== 拦截第三方服务请求 ==========
+      // 拦截 Sentry、Intercom 等第三方服务，减少控制台噪音
+      (function() {
+        const blockedDomains = [
+          'sentry.io',
+          'intercom.io',
+          'intercom.com',
+          'api-iam.intercom.io',
+          'widget.intercom.io'
+        ];
+
+        const blockedPaths = [
+          '/sentry?',  // Sentry 错误上报路径
+          '/sentry/'
+        ];
+
+        const isBlocked = (url) => {
+          if (!url) return false;
+          const urlStr = typeof url === 'string' ? url : url.toString();
+
+          // 检查域名
+          if (blockedDomains.some(domain => urlStr.includes(domain))) {
+            return true;
+          }
+
+          // 检查路径（用于代理内的 Sentry 请求）
+          if (blockedPaths.some(path => urlStr.includes(path))) {
+            return true;
+          }
+
+          return false;
+        };
+
+        // 拦截 fetch 请求
+        try {
+          const originalFetch = window.fetch;
+          window.fetch = function(input, init) {
+            const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+            if (isBlocked(url)) {
+              console.log('[Proxy] 拦截第三方请求:', url);
+              // 返回一个空的成功响应
+              return Promise.resolve(new Response('{}', {
+                status: 200,
+                statusText: 'OK',
+                headers: new Headers({ 'Content-Type': 'application/json' })
+              }));
+            }
+            return originalFetch.apply(this, arguments);
+          };
+        } catch (e) {
+          console.error('[Proxy] fetch 拦截失败:', e);
+        }
+
+        // 拦截 XMLHttpRequest
+        try {
+          const originalOpen = XMLHttpRequest.prototype.open;
+          const originalSend = XMLHttpRequest.prototype.send;
+
+          XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+            this._isBlocked = isBlocked(url);
+            if (this._isBlocked) {
+              console.log('[Proxy] 拦截 XHR 请求:', url);
+            }
+            return originalOpen.apply(this, [method, url, ...rest]);
+          };
+
+          XMLHttpRequest.prototype.send = function(body) {
+            if (this._isBlocked) {
+              // 模拟成功响应
+              Object.defineProperty(this, 'readyState', { writable: true, value: 4 });
+              Object.defineProperty(this, 'status', { writable: true, value: 200 });
+              Object.defineProperty(this, 'statusText', { writable: true, value: 'OK' });
+              Object.defineProperty(this, 'responseText', { writable: true, value: '{}' });
+              Object.defineProperty(this, 'response', { writable: true, value: '{}' });
+
+              setTimeout(() => {
+                if (this.onload) this.onload({ target: this });
+                if (this.onreadystatechange) this.onreadystatechange({ target: this });
+              }, 0);
+              return;
+            }
+            return originalSend.apply(this, arguments);
+          };
+        } catch (e) {
+          console.error('[Proxy] XHR 拦截失败:', e);
+        }
+
+        // 拦截动态脚本加载
+        try {
+          const originalCreateElement = document.createElement;
+          document.createElement = function(tagName) {
+            const element = originalCreateElement.apply(this, arguments);
+
+            if (tagName.toLowerCase() === 'script') {
+              const originalSetAttribute = element.setAttribute;
+              element.setAttribute = function(name, value) {
+                if (name === 'src' && isBlocked(value)) {
+                  console.log('[Proxy] 拦截脚本加载:', value);
+                  return; // 不设置 src，阻止加载
+                }
+                return originalSetAttribute.apply(this, arguments);
+              };
+
+              const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+              if (srcDescriptor && srcDescriptor.set) {
+                Object.defineProperty(element, 'src', {
+                  set: function(value) {
+                    if (isBlocked(value)) {
+                      console.log('[Proxy] 拦截脚本 src:', value);
+                      return;
+                    }
+                    srcDescriptor.set.call(this, value);
+                  },
+                  get: srcDescriptor.get
+                });
+              }
+            }
+
+            return element;
+          };
+        } catch (e) {
+          console.error('[Proxy] 脚本拦截失败:', e);
+        }
+      })();
+
+      // ========== UI 元素隐藏 ==========
+      function injectStyles() {
+        if (document.getElementById('proxy-hide-styles')) return;
+
+        const style = document.createElement('style');
+        style.id = 'proxy-hide-styles';
+        style.textContent = \`
+          /* 隐藏用户菜单按钮 */
+          [data-testid="user-menu-button"],
+          [data-testid="user-menu-button"]:parent {
+            display: none !important;
+          }
+          /* 隐藏用户菜单容器 */
+          .border-t-0\\.5.border-border-300 {
+            display: none !important;
+          }
+          /* 隐藏 Artifacts 导航项 */
+          a[href="/artifacts"],
+          a[href="/artifacts"]:parent {
+            display: none !important;
+          }
+          .relative.group:has(a[href="/artifacts"]) {
+            display: none !important;
+          }
+          /* 隐藏 Code 导航项 */
+          a[href="/code"],
+          a[href="/code"]:parent {
+            display: none !important;
+          }
+          .relative.group:has(a[href="/code"]) {
+            display: none !important;
+          }
+        \`;
+
+        // 优先插入到 head，如果 head 不存在则插入到 documentElement
+        const target = document.head || document.documentElement;
+        if (target) {
+          target.appendChild(style);
+        } else {
+          // 如果都不存在，等待 DOM 准备好
+          document.addEventListener('DOMContentLoaded', () => {
+            (document.head || document.documentElement).appendChild(style);
+          });
+        }
+      }
+      injectStyles();
+
       function hideElements() {
-        // 隐藏用户菜单按钮的容器
         const userMenuBtn = document.querySelector('[data-testid="user-menu-button"]');
         if (userMenuBtn) {
           const container = userMenuBtn.closest('.flex.items-center.gap-2');
@@ -114,7 +810,6 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           }
         }
 
-        // 隐藏 Artifacts 导航项
         const artifactsLink = document.querySelector('a[href="/artifacts"]');
         if (artifactsLink) {
           const container = artifactsLink.closest('.relative.group');
@@ -123,7 +818,6 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           }
         }
 
-        // 隐藏 Code 导航项
         const codeLink = document.querySelector('a[href="/code"]');
         if (codeLink) {
           const container = codeLink.closest('.relative.group');
@@ -131,18 +825,14 @@ app.get('/__proxy__/inject.js', (_req, res) => {
             container.style.display = 'none';
           }
         }
-        // 项目过滤已移到 API 层 (projects_v2)，不需要前端过滤
       }
 
-      // 立即执行
       hideElements();
 
-      // 监听 DOM 变化
       const observer = new MutationObserver(() => {
         hideElements();
       });
 
-      // 确保 document.documentElement 存在
       if (document.documentElement) {
         observer.observe(document.documentElement, {
           childList: true,
@@ -152,7 +842,6 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         });
       }
 
-      // 监听路由变化（等待 body 存在）
       let lastUrl = location.href;
       function setupUrlObserver() {
         if (document.body) {
@@ -165,13 +854,11 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           });
           urlObserver.observe(document.body, { childList: true, subtree: true });
         } else {
-          // body 还不存在，稍后重试
           setTimeout(setupUrlObserver, 50);
         }
       }
       setupUrlObserver();
 
-      // 定时检查
       setInterval(hideElements, 1000);
     })();
   `);
@@ -202,10 +889,10 @@ app.post('/__proxy__/cache/clear', (_req, res) => {
 
 // Claude Code API 代理 - 通过本机 CLI 处理
 // /v1/messages - 主要的聊天接口
-app.post('/v1/messages', createCliProxy());
+app.post('/v1/messages', createAuthMiddleware(), createCliProxy());
 
 // /v1/messages/count_tokens - token 计数（返回假数据）
-app.post('/v1/messages/count_tokens', createTokenCountHandler());
+app.post('/v1/messages/count_tokens', createAuthMiddleware(), createTokenCountHandler());
 
 // 启动服务器
 app.listen(PORT, '0.0.0.0', () => {
@@ -226,5 +913,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`  静态资源缓存: ${stats.count} 个文件, ${stats.sizeMB.toFixed(2)} MB`);
   console.log(`  缓存管理: GET /__proxy__/cache/stats`);
   console.log(`            POST /__proxy__/cache/clear`);
+  console.log('');
+  if (isAuthEnabled()) {
+    console.log('  认证: 已启用 (需要 API Key)');
+    console.log('  管理: npm run auth list');
+  } else {
+    console.log('  认证: 未启用');
+    console.log('  启用: npm run auth create "名称"');
+  }
   console.log('========================================');
 });

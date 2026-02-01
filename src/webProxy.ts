@@ -10,6 +10,13 @@ const CLAUDE_WEB_URL = 'https://claude.ai';
 // 注入的脚本标签
 const INJECT_SCRIPT = '<script src="/__proxy__/inject.js"></script>';
 
+// 伪装的浏览器信息 - 模拟一个通用的 Chrome 浏览器
+const SPOOFED_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const SPOOFED_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
+const SPOOFED_SEC_CH_UA = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
+const SPOOFED_SEC_CH_UA_PLATFORM = '"Windows"';
+const SPOOFED_SEC_CH_UA_MOBILE = '?0';
+
 // 配置类型
 interface Config {
   allowedChats: string[];
@@ -236,6 +243,29 @@ export function createWebProxy(sessionKey: string): RequestHandler {
         // 移除可能暴露代理的头
         proxyReq.removeHeader('x-forwarded-host');
         proxyReq.removeHeader('x-forwarded-proto');
+        proxyReq.removeHeader('x-forwarded-for');
+        proxyReq.removeHeader('x-real-ip');
+        proxyReq.removeHeader('x-client-ip');
+        proxyReq.removeHeader('cf-connecting-ip');
+        proxyReq.removeHeader('true-client-ip');
+        proxyReq.removeHeader('via');
+
+        // 覆盖客户端浏览器指纹相关的请求头
+        proxyReq.setHeader('user-agent', SPOOFED_USER_AGENT);
+        proxyReq.setHeader('accept-language', SPOOFED_ACCEPT_LANGUAGE);
+        proxyReq.setHeader('sec-ch-ua', SPOOFED_SEC_CH_UA);
+        proxyReq.setHeader('sec-ch-ua-platform', SPOOFED_SEC_CH_UA_PLATFORM);
+        proxyReq.setHeader('sec-ch-ua-mobile', SPOOFED_SEC_CH_UA_MOBILE);
+
+        // 修正 referer 和 origin，避免暴露代理地址
+        const referer = proxyReq.getHeader('referer') as string;
+        if (referer) {
+          proxyReq.setHeader('referer', referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai'));
+        }
+        const origin = proxyReq.getHeader('origin') as string;
+        if (origin && !origin.includes('claude.ai')) {
+          proxyReq.setHeader('origin', 'https://claude.ai');
+        }
 
         // 请求未压缩的响应，便于修改
         proxyReq.setHeader('accept-encoding', 'identity');
@@ -550,8 +580,13 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               let html = Buffer.concat(chunks).toString('utf8');
 
-              // 在 </head> 前注入脚本
-              if (html.includes('</head>')) {
+              // 在 <head> 后立即注入脚本，确保最先执行
+              // 使用正则匹配 <head> 标签（可能带属性如 <head lang="en">）
+              const headOpenRegex = /<head(\s[^>]*)?>|<head>/i;
+              const headMatch = html.match(headOpenRegex);
+              if (headMatch) {
+                html = html.replace(headMatch[0], `${headMatch[0]}${INJECT_SCRIPT}`);
+              } else if (html.includes('</head>')) {
                 html = html.replace('</head>', `${INJECT_SCRIPT}</head>`);
               }
 

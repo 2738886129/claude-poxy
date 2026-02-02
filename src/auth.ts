@@ -16,6 +16,7 @@ export interface ApiKeyEntry {
   lastUsedAt?: string;
   expiresInDays: number;     // Cookie 有效期（天）
   permissions: KeyPermission[];  // 授权类型：web（浏览器）、api（Claude Code）
+  isAdmin?: boolean;         // 是否为管理员凭证（可访问所有对话和项目，无脚本注入）
 }
 
 interface AuthConfig {
@@ -119,7 +120,8 @@ export function hasAdminPassword(): boolean {
 export function createApiKey(
   name: string,
   expiresInDays: number = 7,
-  permissions: KeyPermission[] = ['web', 'api']  // 默认两种权限都有
+  permissions: KeyPermission[] = ['web', 'api'],  // 默认两种权限都有
+  isAdmin: boolean = false  // 是否为管理员凭证
 ): { id: string; key: string } {
   const config = loadAuthConfig();
   const key = generateApiKey();
@@ -134,6 +136,7 @@ export function createApiKey(
     createdAt: new Date().toISOString(),
     expiresInDays,
     permissions,
+    isAdmin,
   };
 
   config.apiKeys.push(entry);
@@ -141,7 +144,8 @@ export function createApiKey(
   saveAuthConfig(config);
 
   const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
-  console.log(`[Auth] 创建 API Key: ${name} (${id}), 有效期: ${expiresInDays} 天, 权限: ${permStr}`);
+  const adminStr = isAdmin ? ' [管理员]' : '';
+  console.log(`[Auth] 创建 API Key: ${name} (${id}), 有效期: ${expiresInDays} 天, 权限: ${permStr}${adminStr}`);
   return { id, key };
 }
 
@@ -542,6 +546,7 @@ export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[
           <label class="perm-checkbox"><input type="checkbox" name="perm_api" value="1" ${k.permissions.includes('api') ? 'checked' : ''} onchange="this.form.submit()"> API</label>
         </form>
       </td>
+      <td>${k.isAdmin ? '<span class="badge" style="background:#fee2e2;color:#dc2626;">管理员</span>' : '<span class="badge" style="background:#e5e7eb;color:#4b5563;">普通</span>'}</td>
       <td>${k.expiresInDays} 天</td>
       <td>${new Date(k.createdAt).toLocaleString('zh-CN')}</td>
       <td>${k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString('zh-CN') : '从未'}</td>
@@ -724,6 +729,13 @@ export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[
               <label><input type="checkbox" name="perm_api" value="1" checked> Claude Code</label>
             </div>
           </div>
+          <div class="form-group">
+            <label>管理员权限</label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" name="isAdmin"> 管理员凭证</label>
+            </div>
+            <small style="color:#666;font-size:12px;display:block;margin-top:4px;">管理员可访问所有对话和项目,无脚本注入</small>
+          </div>
           <div class="form-group" style="display:flex;align-items:flex-end;">
             <button type="submit" class="btn-primary">创建</button>
           </div>
@@ -742,6 +754,7 @@ export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[
               <th>名称</th>
               <th>Key</th>
               <th>权限</th>
+              <th>角色</th>
               <th>有效期</th>
               <th>创建时间</th>
               <th>最后使用</th>

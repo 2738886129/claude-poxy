@@ -10,6 +10,20 @@ const CLAUDE_WEB_URL = 'https://claude.ai';
 
 // 注入的脚本 - 关键 polyfill 必须内联执行,确保在 Claude 代码之前运行
 // 其他伪装代码仍然通过外部脚本加载
+// 管理员模式：仅注入必需的 crypto.randomUUID polyfill
+const ADMIN_MINIMAL_SCRIPT = `<script>
+// ========== 关键 polyfill: crypto.randomUUID ==========
+// 管理员模式：仅注入此 polyfill，不加载其他伪装脚本
+if (!crypto.randomUUID) {
+  crypto.randomUUID = function() {
+    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, function(c) {
+      return (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16);
+    });
+  };
+}
+</script>`;
+
+// 普通模式：注入 polyfill + 加载伪装脚本
 const INJECT_SCRIPT = `<script>
 // ========== 关键 polyfill: crypto.randomUUID ==========
 // 必须在此内联,因为 Claude 的代码会立即使用
@@ -378,14 +392,14 @@ export function createWebProxy(sessionKey: string): RequestHandler {
         const reqUrl = req.url || '';
         const reqMethod = req.method || 'GET';
 
-        // 处理删除对话 API - 从允许列表移除
+        // 处理删除对话 API - 从允许列表移除(仅非管理员)
         const deleteChat = isDeleteChatApi(reqUrl, reqMethod);
         if (deleteChat.isDelete && deleteChat.uuid) {
           const chatUuid = deleteChat.uuid;
-          // 删除成功时从配置中移除
+          // 删除成功时从配置中移除(仅非管理员)
           if (proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
             const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
-            if (keyEntry) {
+            if (keyEntry && !keyEntry.isAdmin) {
               removeAllowedChatFromKey(keyEntry.id, chatUuid);
               console.log(`[Web Proxy] 对话已删除并从凭证 ${keyEntry.name} 移除:`, chatUuid);
             }
@@ -396,14 +410,14 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           return;
         }
 
-        // 处理删除项目 API - 从允许列表移除
+        // 处理删除项目 API - 从允许列表移除(仅非管理员)
         const deleteProject = isDeleteProjectApi(reqUrl, reqMethod);
         if (deleteProject.isDelete && deleteProject.uuid) {
           const projectUuid = deleteProject.uuid;
-          // 删除成功时从配置中移除
+          // 删除成功时从配置中移除(仅非管理员)
           if (proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
             const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
-            if (keyEntry) {
+            if (keyEntry && !keyEntry.isAdmin) {
               removeAllowedProjectFromKey(keyEntry.id, projectUuid);
               console.log(`[Web Proxy] 项目已删除并从凭证 ${keyEntry.name} 移除:`, projectUuid);
             }
@@ -424,11 +438,11 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
 
-              // 如果创建成功，将新对话 UUID 添加到配置
+              // 如果创建成功，将新对话 UUID 添加到配置(仅非管理员)
               if (data && data.uuid && proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
                 const chatUuid = data.uuid;
                 const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
-                if (keyEntry) {
+                if (keyEntry && !keyEntry.isAdmin) {
                   addAllowedChatToKey(keyEntry.id, chatUuid);
                   console.log(`[Web Proxy] 新对话已创建并自动添加到凭证 ${keyEntry.name}:`, chatUuid);
                 }
@@ -461,11 +475,11 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
 
-              // 如果创建成功，将新项目 UUID 添加到配置
+              // 如果创建成功，将新项目 UUID 添加到配置(仅非管理员)
               if (data && data.uuid && proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
                 const projectUuid = data.uuid;
                 const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
-                if (keyEntry) {
+                if (keyEntry && !keyEntry.isAdmin) {
                   addAllowedProjectToKey(keyEntry.id, projectUuid);
                   console.log(`[Web Proxy] 新项目已创建并自动添加到凭证 ${keyEntry.name}:`, projectUuid);
                 }
@@ -498,6 +512,20 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               const body = Buffer.concat(chunks).toString('utf8');
               let data = JSON.parse(body);
               const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+
+              // 管理员模式:不过滤搜索结果
+              if (keyEntry && keyEntry.isAdmin) {
+                const responseBody = JSON.stringify(data);
+                const responseBuffer = Buffer.from(responseBody, 'utf8');
+                const headers = { ...proxyRes.headers };
+                headers['content-length'] = String(responseBuffer.length);
+                delete headers['content-encoding'];
+                (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
+                (res as ServerResponse).end(responseBuffer);
+                return;
+              }
+
+              // 普通模式:过滤搜索结果
               const effectiveChatList = getEffectiveAllowedList(keyEntry, 'chats');
 
               // 如果响应是双重编码的 JSON 字符串，再解析一次
@@ -562,6 +590,16 @@ export function createWebProxy(sessionKey: string): RequestHandler {
         // 处理对话计数 API
         if (isChatCountApi(reqUrl) && contentType.includes('application/json')) {
           const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+
+          // 管理员模式:直接透传真实数量
+          if (keyEntry && keyEntry.isAdmin) {
+            // 直接转发原始响应
+            (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+            proxyRes.pipe(res as ServerResponse);
+            return;
+          }
+
+          // 普通模式:返回过滤后的数量
           const effectiveList = getEffectiveAllowedList(keyEntry, 'chats');
           if (shouldFilter(effectiveList)) {
             // 返回允许的聊天数量
@@ -597,6 +635,20 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
               const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+
+              // 管理员模式:不过滤,直接返回所有对话
+              if (keyEntry && keyEntry.isAdmin) {
+                const responseBody = JSON.stringify(data);
+                const responseBuffer = Buffer.from(responseBody, 'utf8');
+                const headers = { ...proxyRes.headers };
+                headers['content-length'] = String(responseBuffer.length);
+                delete headers['content-encoding'];
+                (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
+                (res as ServerResponse).end(responseBuffer);
+                return;
+              }
+
+              // 普通模式:应用白名单过滤
               const effectiveList = getEffectiveAllowedList(keyEntry, 'chats');
               const filtered = filterList(data, effectiveList);
               const responseBody = JSON.stringify(filtered);
@@ -627,6 +679,20 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
               const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+
+              // 管理员模式:不过滤,返回所有项目
+              if (keyEntry && keyEntry.isAdmin) {
+                const responseBody = JSON.stringify(data);
+                const responseBuffer = Buffer.from(responseBody, 'utf8');
+                const headers = { ...proxyRes.headers };
+                headers['content-length'] = String(responseBuffer.length);
+                delete headers['content-encoding'];
+                (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
+                (res as ServerResponse).end(responseBuffer);
+                return;
+              }
+
+              // 普通模式:应用白名单过滤
               const effectiveList = getEffectiveAllowedList(keyEntry, 'projects');
 
               console.log('[Web Proxy] 项目列表 API 响应结构:', JSON.stringify(data).substring(0, 500));
@@ -679,25 +745,29 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
         // 处理 HTML 响应，注入脚本
         if (contentType.includes('text/html')) {
+          const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
           const chunks: Buffer[] = [];
 
           proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
           proxyRes.on('end', () => {
             try {
-              let html = Buffer.concat(chunks).toString('utf8');
+              let htmlStr = Buffer.concat(chunks).toString('utf8');
 
-              // 在 <head> 后立即注入关键 polyfill 脚本
+              // 选择注入脚本：管理员模式仅注入必需 polyfill，普通模式注入完整脚本
+              const scriptToInject = (keyEntry && keyEntry.isAdmin) ? ADMIN_MINIMAL_SCRIPT : INJECT_SCRIPT;
+
+              // 在 <head> 后立即注入脚本
               // 注意: 这会导致 React hydration 警告 #418,但不影响功能
               // React #418 是由于 SSR HTML 和客户端 HTML 不匹配,但这是代理的必要副作用
               const headOpenRegex = /<head(\s[^>]*)?>|<head>/i;
-              const headMatch = html.match(headOpenRegex);
+              const headMatch = htmlStr.match(headOpenRegex);
               if (headMatch) {
-                html = html.replace(headMatch[0], `${headMatch[0]}${INJECT_SCRIPT}`);
-              } else if (html.includes('</head>')) {
-                html = html.replace('</head>', `${INJECT_SCRIPT}</head>`);
+                htmlStr = htmlStr.replace(headMatch[0], `${headMatch[0]}${scriptToInject}`);
+              } else if (htmlStr.includes('</head>')) {
+                htmlStr = htmlStr.replace('</head>', `${scriptToInject}</head>`);
               }
 
-              const responseBuffer = Buffer.from(html, 'utf8');
+              const responseBuffer = Buffer.from(htmlStr, 'utf8');
 
               const headers = { ...proxyRes.headers };
               headers['content-length'] = String(responseBuffer.length);

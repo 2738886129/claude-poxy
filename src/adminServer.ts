@@ -92,6 +92,9 @@ export function startAdminServer(): Server {
     if (req.body.perm_web) permissions.push('web');
     if (req.body.perm_api) permissions.push('api');
 
+    // 解析是否为管理员
+    const isAdmin = req.body.isAdmin === 'on';
+
     if (!name) {
       return res.redirect('/dashboard?message=名称不能为空');
     }
@@ -100,9 +103,10 @@ export function startAdminServer(): Server {
       return res.redirect('/dashboard?message=请至少选择一种授权类型');
     }
 
-    createApiKey(name, days, permissions);
+    createApiKey(name, days, permissions, isAdmin);
     const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
-    res.redirect(`/dashboard?message=Key "${name}" 创建成功 (${permStr})`);
+    const adminStr = isAdmin ? ' [管理员]' : '';
+    res.redirect(`/dashboard?message=Key "${name}" 创建成功 (${permStr}${adminStr})`);
   });
 
   // 撤销 Key（管理员操作）

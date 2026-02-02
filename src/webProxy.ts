@@ -1,14 +1,34 @@
 import { createProxyMiddleware } from 'http-proxy-middleware';
-import type { RequestHandler } from 'express';
+import type { RequestHandler, Request } from 'express';
 import type { ServerResponse } from 'http';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { getCache } from './staticCache.js';
+import type { ApiKeyEntry } from './auth.js';
 
 const CLAUDE_WEB_URL = 'https://claude.ai';
 
-// 注入的脚本标签
-const INJECT_SCRIPT = '<script src="/__proxy__/inject.js"></script>';
+// 注入的脚本 - 关键 polyfill 必须内联执行,确保在 Claude 代码之前运行
+// 其他伪装代码仍然通过外部脚本加载
+const INJECT_SCRIPT = `<script>
+// ========== 关键 polyfill: crypto.randomUUID ==========
+// 必须在此内联,因为 Claude 的代码会立即使用
+if (!crypto.randomUUID) {
+  console.log('[Proxy] 注入 crypto.randomUUID polyfill');
+  crypto.randomUUID = function() {
+    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, function(c) {
+      return (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16);
+    });
+  };
+}
+// ========== 加载其他伪装脚本 ==========
+(function(){
+  var s=document.createElement('script');
+  s.src='/__proxy__/inject.js';
+  s.async=false;
+  (document.head||document.documentElement).appendChild(s);
+})();
+</script>`;
 
 // 伪装的浏览器信息 - 模拟一个通用的 Chrome 浏览器
 const SPOOFED_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -17,17 +37,24 @@ const SPOOFED_SEC_CH_UA = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chro
 const SPOOFED_SEC_CH_UA_PLATFORM = '"Windows"';
 const SPOOFED_SEC_CH_UA_MOBILE = '?0';
 
-// 配置类型
-interface Config {
+// 凭证级别的权限配置
+interface KeyPermissionConfig {
   allowedChats: string[];
   allowedProjects: string[];
+  revoked?: boolean;  // 标记凭证是否已被撤销
+  revokedAt?: string; // 撤销时间（ISO 8601 格式）
+}
+
+// config.json 的新结构：{ keyId: config }
+interface ConfigFile {
+  [keyId: string]: KeyPermissionConfig;
 }
 
 // 配置文件路径
 const CONFIG_PATH = join(process.cwd(), 'config.json');
 
 // 读取配置文件
-function loadConfig(): Config {
+function loadConfig(): ConfigFile {
   if (existsSync(CONFIG_PATH)) {
     try {
       const content = readFileSync(CONFIG_PATH, 'utf-8');
@@ -36,58 +63,119 @@ function loadConfig(): Config {
       console.error('[Config] 读取配置文件失败:', err);
     }
   }
-  return { allowedChats: [], allowedProjects: [] };
+  return {};
 }
 
 // 保存配置文件
-function saveConfig(config: Config): void {
+function saveConfig(config: ConfigFile): void {
   try {
     writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-    console.log('[Config] 配置已保存');
   } catch (err) {
     console.error('[Config] 保存配置文件失败:', err);
   }
 }
 
-// 添加新对话到允许列表
-function addAllowedChat(chatUuid: string): void {
+// 获取凭证的权限配置（默认严格模式）
+function getKeyPermissionConfig(keyId: string): KeyPermissionConfig {
   const config = loadConfig();
-  if (!config.allowedChats.includes(chatUuid)) {
-    config.allowedChats.push(chatUuid);
+  return config[keyId] || { allowedChats: [], allowedProjects: [] };
+}
+
+// 扩展 Request 类型，包含凭证信息
+interface RequestWithApiKey extends Request {
+  apiKeyEntry?: ApiKeyEntry;
+}
+
+// 获取有效的允许列表（凭证隔离）
+function getEffectiveAllowedList(
+  keyEntry: ApiKeyEntry | undefined,
+  type: 'chats' | 'projects'
+): string[] {
+  if (!keyEntry) {
+    return [];  // 未认证，默认严格模式
+  }
+
+  const permConfig = getKeyPermissionConfig(keyEntry.id);
+  return type === 'chats' ? permConfig.allowedChats : permConfig.allowedProjects;
+}
+
+// 自动添加对话到凭证白名单
+function addAllowedChatToKey(keyId: string, chatUuid: string): void {
+  const config = loadConfig();
+
+  if (!config[keyId]) {
+    config[keyId] = { allowedChats: [], allowedProjects: [] };
+  }
+
+  if (!config[keyId].allowedChats.includes(chatUuid)) {
+    config[keyId].allowedChats.push(chatUuid);
     saveConfig(config);
-    console.log('[Config] 新对话已添加:', chatUuid);
+    console.log(`[Config] 对话 ${chatUuid} 已自动添加到凭证 ${keyId}`);
   }
 }
 
-// 添加新项目到允许列表
-function addAllowedProject(projectUuid: string): void {
+// 自动从凭证移除对话
+function removeAllowedChatFromKey(keyId: string, chatUuid: string): void {
   const config = loadConfig();
-  if (!config.allowedProjects.includes(projectUuid)) {
-    config.allowedProjects.push(projectUuid);
-    saveConfig(config);
-    console.log('[Config] 新项目已添加:', projectUuid);
+
+  if (config[keyId] && config[keyId].allowedChats) {
+    const index = config[keyId].allowedChats.indexOf(chatUuid);
+    if (index !== -1) {
+      config[keyId].allowedChats.splice(index, 1);
+      saveConfig(config);
+      console.log(`[Config] 对话 ${chatUuid} 已从凭证 ${keyId} 移除`);
+    }
   }
 }
 
-// 从允许列表中移除对话
-function removeAllowedChat(chatUuid: string): void {
+// 自动添加项目到凭证白名单
+function addAllowedProjectToKey(keyId: string, projectUuid: string): void {
   const config = loadConfig();
-  const index = config.allowedChats.indexOf(chatUuid);
-  if (index !== -1) {
-    config.allowedChats.splice(index, 1);
+
+  if (!config[keyId]) {
+    config[keyId] = { allowedChats: [], allowedProjects: [] };
+  }
+
+  if (!config[keyId].allowedProjects.includes(projectUuid)) {
+    config[keyId].allowedProjects.push(projectUuid);
     saveConfig(config);
-    console.log('[Config] 对话已移除:', chatUuid);
+    console.log(`[Config] 项目 ${projectUuid} 已自动添加到凭证 ${keyId}`);
   }
 }
 
-// 从允许列表中移除项目
-function removeAllowedProject(projectUuid: string): void {
+// 自动从凭证移除项目
+function removeAllowedProjectFromKey(keyId: string, projectUuid: string): void {
   const config = loadConfig();
-  const index = config.allowedProjects.indexOf(projectUuid);
-  if (index !== -1) {
-    config.allowedProjects.splice(index, 1);
+
+  if (config[keyId] && config[keyId].allowedProjects) {
+    const index = config[keyId].allowedProjects.indexOf(projectUuid);
+    if (index !== -1) {
+      config[keyId].allowedProjects.splice(index, 1);
+      saveConfig(config);
+      console.log(`[Config] 项目 ${projectUuid} 已从凭证 ${keyId} 移除`);
+    }
+  }
+}
+
+// 导出此函数供 auth-cli 调用
+export function markKeyAsRevoked(keyId: string): void {
+  const config = loadConfig();
+
+  if (config[keyId]) {
+    config[keyId].revoked = true;
+    config[keyId].revokedAt = new Date().toISOString();
     saveConfig(config);
-    console.log('[Config] 项目已移除:', projectUuid);
+    console.log(`[Config] 凭证 ${keyId} 已标记为已撤销`);
+  } else {
+    // 如果配置不存在，创建一个空配置并标记
+    config[keyId] = {
+      allowedChats: [],
+      allowedProjects: [],
+      revoked: true,
+      revokedAt: new Date().toISOString()
+    };
+    saveConfig(config);
+    console.log(`[Config] 凭证 ${keyId} 配置已创建并标记为已撤销`);
   }
 }
 
@@ -296,8 +384,11 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           const chatUuid = deleteChat.uuid;
           // 删除成功时从配置中移除
           if (proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-            removeAllowedChat(chatUuid);
-            console.log('[Web Proxy] 对话已删除并从允许列表移除:', chatUuid);
+            const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+            if (keyEntry) {
+              removeAllowedChatFromKey(keyEntry.id, chatUuid);
+              console.log(`[Web Proxy] 对话已删除并从凭证 ${keyEntry.name} 移除:`, chatUuid);
+            }
           }
           // 直接转发响应
           (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
@@ -311,8 +402,11 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           const projectUuid = deleteProject.uuid;
           // 删除成功时从配置中移除
           if (proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-            removeAllowedProject(projectUuid);
-            console.log('[Web Proxy] 项目已删除并从允许列表移除:', projectUuid);
+            const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+            if (keyEntry) {
+              removeAllowedProjectFromKey(keyEntry.id, projectUuid);
+              console.log(`[Web Proxy] 项目已删除并从凭证 ${keyEntry.name} 移除:`, projectUuid);
+            }
           }
           // 直接转发响应
           (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
@@ -332,8 +426,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
               // 如果创建成功，将新对话 UUID 添加到配置
               if (data && data.uuid && proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-                addAllowedChat(data.uuid);
-                console.log('[Web Proxy] 新对话已创建并添加到允许列表:', data.uuid);
+                const chatUuid = data.uuid;
+                const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+                if (keyEntry) {
+                  addAllowedChatToKey(keyEntry.id, chatUuid);
+                  console.log(`[Web Proxy] 新对话已创建并自动添加到凭证 ${keyEntry.name}:`, chatUuid);
+                }
               }
 
               // 原样返回响应
@@ -365,8 +463,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
               // 如果创建成功，将新项目 UUID 添加到配置
               if (data && data.uuid && proxyRes.statusCode && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-                addAllowedProject(data.uuid);
-                console.log('[Web Proxy] 新项目已创建并添加到允许列表:', data.uuid);
+                const projectUuid = data.uuid;
+                const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+                if (keyEntry) {
+                  addAllowedProjectToKey(keyEntry.id, projectUuid);
+                  console.log(`[Web Proxy] 新项目已创建并自动添加到凭证 ${keyEntry.name}:`, projectUuid);
+                }
               }
 
               // 原样返回响应
@@ -395,7 +497,8 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               const body = Buffer.concat(chunks).toString('utf8');
               let data = JSON.parse(body);
-              const config = loadConfig();
+              const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+              const effectiveChatList = getEffectiveAllowedList(keyEntry, 'chats');
 
               // 如果响应是双重编码的 JSON 字符串，再解析一次
               if (typeof data === 'string') {
@@ -423,8 +526,8 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
                   // 对话类型
                   if (docType === 'conversation' && conversationUuid) {
-                    if (shouldFilter(config.allowedChats)) {
-                      return config.allowedChats.includes(conversationUuid);
+                    if (shouldFilter(effectiveChatList)) {
+                      return effectiveChatList.includes(conversationUuid);
                     }
                   }
 
@@ -458,12 +561,13 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
         // 处理对话计数 API
         if (isChatCountApi(reqUrl) && contentType.includes('application/json')) {
-          const config = loadConfig();
-          if (shouldFilter(config.allowedChats)) {
+          const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+          const effectiveList = getEffectiveAllowedList(keyEntry, 'chats');
+          if (shouldFilter(effectiveList)) {
             // 返回允许的聊天数量
             const responseData = {
-              count: config.allowedChats.length,
-              is_first_conversation: config.allowedChats.length === 0
+              count: effectiveList.length,
+              is_first_conversation: effectiveList.length === 0
             };
             const responseBody = JSON.stringify(responseData);
             const responseBuffer = Buffer.from(responseBody, 'utf8');
@@ -492,8 +596,9 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
-              const config = loadConfig();
-              const filtered = filterList(data, config.allowedChats);
+              const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+              const effectiveList = getEffectiveAllowedList(keyEntry, 'chats');
+              const filtered = filterList(data, effectiveList);
               const responseBody = JSON.stringify(filtered);
               const responseBuffer = Buffer.from(responseBody, 'utf8');
 
@@ -521,23 +626,24 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               const body = Buffer.concat(chunks).toString('utf8');
               const data = JSON.parse(body);
-              const config = loadConfig();
+              const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+              const effectiveList = getEffectiveAllowedList(keyEntry, 'projects');
 
               console.log('[Web Proxy] 项目列表 API 响应结构:', JSON.stringify(data).substring(0, 500));
 
               let filtered;
-              if (shouldFilter(config.allowedProjects)) {
+              if (shouldFilter(effectiveList)) {
                 // projects_v2 可能返回数组或带有 results/data 字段的对象
                 if (Array.isArray(data)) {
                   filtered = data.filter((item: { uuid?: string }) =>
-                    item.uuid && config.allowedProjects.includes(item.uuid)
+                    item.uuid && effectiveList.includes(item.uuid)
                   );
                 } else if (data && typeof data === 'object') {
                   // 可能是 { results: [...] } 或 { data: [...] } 格式
                   const arrayField = data.results || data.data || data.projects;
                   if (Array.isArray(arrayField)) {
                     const filteredArray = arrayField.filter((item: { uuid?: string }) =>
-                      item.uuid && config.allowedProjects.includes(item.uuid)
+                      item.uuid && effectiveList.includes(item.uuid)
                     );
                     filtered = { ...data };
                     if (data.results) filtered.results = filteredArray;
@@ -580,8 +686,9 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               let html = Buffer.concat(chunks).toString('utf8');
 
-              // 在 <head> 后立即注入脚本，确保最先执行
-              // 使用正则匹配 <head> 标签（可能带属性如 <head lang="en">）
+              // 在 <head> 后立即注入关键 polyfill 脚本
+              // 注意: 这会导致 React hydration 警告 #418,但不影响功能
+              // React #418 是由于 SSR HTML 和客户端 HTML 不匹配,但这是代理的必要副作用
               const headOpenRegex = /<head(\s[^>]*)?>|<head>/i;
               const headMatch = html.match(headOpenRegex);
               if (headMatch) {

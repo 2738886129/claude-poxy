@@ -6,7 +6,14 @@ import { join } from 'path';
 import { createWebProxy } from './webProxy.js';
 import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
-import { createAuthMiddleware, validateApiKey, getLoginPageHtml, isAuthEnabled, getKeyExpiresMs } from './auth.js';
+import {
+  createAuthMiddleware,
+  validateApiKey,
+  getLoginPageHtml,
+  isAuthEnabled,
+  getKeyExpiresMs
+} from './auth.js';
+import { startAdminServer } from './adminServer.js';
 
 // 读取配置文件
 function loadConfig(): { allowedChats: string[]; allowedProjects: string[] } {
@@ -139,6 +146,17 @@ app.get('/__proxy__/inject.js', (_req, res) => {
   res.setHeader('Expires', '0');
   res.type('application/javascript').send(`
     (function() {
+      // ========== 修复 crypto.randomUUID 缺失问题 ==========
+      // HTTP 环境下 crypto.randomUUID 不可用，提供 polyfill
+      if (!crypto.randomUUID) {
+        console.log('[Proxy] 注入 crypto.randomUUID polyfill');
+        crypto.randomUUID = function() {
+          return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+            (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+          );
+        };
+      }
+
       // ========== 浏览器指纹伪装（调试模式：暂时禁用） ==========
       // 如果遇到 Claude 阻止访问，可以临时注释掉指纹伪装，只保留 UI 隐藏
       const ENABLE_FINGERPRINT_SPOOFING = true; // 设为 false 禁用指纹伪装
@@ -441,30 +459,33 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         };
       }
 
-      // 伪装 ClientRects 指纹
+      // 伪装 ClientRects 指纹 - 使用更保守的策略,避免影响 React
       const originalGetBoundingClientRect = Element.prototype.getBoundingClientRect;
       Element.prototype.getBoundingClientRect = function() {
         const rect = originalGetBoundingClientRect.call(this);
-        // 创建一个类似 DOMRect 的对象，保持原型链
-        const roundedRect = {
-          x: Math.round(rect.x),
-          y: Math.round(rect.y),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height),
-          top: Math.round(rect.top),
-          right: Math.round(rect.right),
-          bottom: Math.round(rect.bottom),
-          left: Math.round(rect.left),
-          toJSON: function() {
-            return { x: this.x, y: this.y, width: this.width, height: this.height,
-                     top: this.top, right: this.right, bottom: this.bottom, left: this.left };
-          }
-        };
-        // 尝试设置原型为 DOMRect，如果失败则返回普通对象
-        try {
-          Object.setPrototypeOf(roundedRect, DOMRect.prototype);
-        } catch (e) {}
-        return roundedRect;
+        // 只对非常小的元素(可能用于指纹)进行舍入,避免影响正常布局
+        if (rect.width < 50 && rect.height < 50) {
+          const roundedRect = {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            top: Math.round(rect.top),
+            right: Math.round(rect.right),
+            bottom: Math.round(rect.bottom),
+            left: Math.round(rect.left),
+            toJSON: function() {
+              return { x: this.x, y: this.y, width: this.width, height: this.height,
+                       top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+            }
+          };
+          try {
+            Object.setPrototypeOf(roundedRect, DOMRect.prototype);
+          } catch (e) {}
+          return roundedRect;
+        }
+        // 正常大小的元素返回原始值,不影响 React
+        return rect;
       };
 
       // 伪装 Plugins 和 MimeTypes
@@ -593,20 +614,21 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         }
       } catch (e) {}
 
-      // 伪装字体检测 - 通过标准化元素尺寸测量
+      // 伪装字体检测 - 使用更严格的条件,避免影响 React
       try {
         const originalOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
         const originalOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
 
         if (originalOffsetWidth && originalOffsetHeight) {
-          // 对用于字体检测的小元素返回标准化尺寸
+          // 只对明显用于指纹检测的隐藏小元素标准化尺寸
           Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
             get: function() {
               const width = originalOffsetWidth.get.call(this);
-              // 字体检测通常使用很小的测试元素
+              // 更严格的条件:必须是绝对定位且完全隐藏的超小元素
               if (this.style && this.style.position === 'absolute' &&
-                  this.style.left === '-9999px' && width < 500) {
-                return Math.round(width / 10) * 10; // 四舍五入到10的倍数
+                  (this.style.left === '-9999px' || this.style.visibility === 'hidden') &&
+                  width < 100) {
+                return Math.round(width / 10) * 10;
               }
               return width;
             },
@@ -617,7 +639,8 @@ app.get('/__proxy__/inject.js', (_req, res) => {
             get: function() {
               const height = originalOffsetHeight.get.call(this);
               if (this.style && this.style.position === 'absolute' &&
-                  this.style.left === '-9999px' && height < 500) {
+                  (this.style.left === '-9999px' || this.style.visibility === 'hidden') &&
+                  height < 100) {
                 return Math.round(height / 10) * 10;
               }
               return height;
@@ -722,7 +745,7 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           document.createElement = function(tagName) {
             const element = originalCreateElement.apply(this, arguments);
 
-            if (tagName.toLowerCase() === 'script') {
+            if (tagName && typeof tagName === 'string' && tagName.toLowerCase() === 'script') {
               const originalSetAttribute = element.setAttribute;
               element.setAttribute = function(name, value) {
                 if (name === 'src' && isBlocked(value)) {
@@ -895,7 +918,7 @@ app.post('/v1/messages', createAuthMiddleware(), createCliProxy());
 app.post('/v1/messages/count_tokens', createAuthMiddleware(), createTokenCountHandler());
 
 // 启动服务器
-app.listen(PORT, '0.0.0.0', () => {
+const mainServer = app.listen(PORT, '0.0.0.0', () => {
   const cache = getCache();
   const stats = cache.getStats();
 
@@ -923,3 +946,59 @@ app.listen(PORT, '0.0.0.0', () => {
   }
   console.log('========================================');
 });
+
+// 启动管理员服务器（独立端口，仅本地访问）
+const adminServer = startAdminServer();
+
+// 优雅关闭：处理进程退出信号
+let isShuttingDown = false;
+
+function gracefulShutdown(signal: string) {
+  if (isShuttingDown) {
+    console.log('[Server] 已在关闭中，请稍候...');
+    return;
+  }
+  isShuttingDown = true;
+
+  console.log(`\n[Server] 收到 ${signal} 信号，正在关闭服务...`);
+
+  let mainClosed = false;
+  let adminClosed = false;
+
+  const checkAndExit = () => {
+    if (mainClosed && adminClosed) {
+      console.log('[Server] 所有服务已关闭，退出进程');
+      process.exit(0);
+    }
+  };
+
+  // 关闭主服务器
+  mainServer.close((err) => {
+    if (err) console.error('[Server] 主服务器关闭错误:', err.message);
+    else console.log('[Server] 主服务器已关闭');
+    mainClosed = true;
+    checkAndExit();
+  });
+
+  // 关闭管理服务器
+  adminServer.close((err) => {
+    if (err) console.error('[Server] 管理服务器关闭错误:', err.message);
+    else console.log('[Server] 管理服务器已关闭');
+    adminClosed = true;
+    checkAndExit();
+  });
+
+  // 强制超时退出（3秒）
+  setTimeout(() => {
+    console.log('[Server] 关闭超时，强制退出');
+    process.exit(1);
+  }, 3000);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Windows 系统下处理 Ctrl+C
+if (process.platform === 'win32') {
+  process.on('SIGBREAK', () => gracefulShutdown('SIGBREAK'));
+}

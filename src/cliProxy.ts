@@ -1,9 +1,26 @@
 import { spawn, ChildProcess } from 'child_process';
 import type { Request, Response, RequestHandler } from 'express';
 
+// 内容块类型定义
+interface TextContent {
+  type: 'text';
+  text: string;
+}
+
+interface ImageContent {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: string;  // 如 "image/png", "image/jpeg"
+    data: string;        // base64 编码的图片数据
+  };
+}
+
+type ContentPart = TextContent | ImageContent | { type: string; text?: string };
+
 interface Message {
   role: 'user' | 'assistant';
-  content: string | Array<{ type: string; text?: string }>;
+  content: string | ContentPart[];
 }
 
 interface ApiRequest {
@@ -13,15 +30,26 @@ interface ApiRequest {
   stream?: boolean;
 }
 
-// 从 message 中提取文本内容
+// 从 message 中提取内容（文本 + 图片）
+// 图片会被转换为 data URL 格式嵌入文本中
 function extractMessageContent(msg: Message): string {
   if (typeof msg.content === 'string') {
     return msg.content;
   } else if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter(part => part.type === 'text' && part.text)
-      .map(part => part.text)
-      .join('\n');
+    const parts: string[] = [];
+
+    for (const part of msg.content) {
+      if (part.type === 'text' && 'text' in part && part.text) {
+        parts.push(part.text);
+      } else if (part.type === 'image' && 'source' in part) {
+        // 将图片转换为 data URL 格式
+        const imgPart = part as ImageContent;
+        const dataUrl = `data:${imgPart.source.media_type};base64,${imgPart.source.data}`;
+        parts.push(`[图片: ${dataUrl}]`);
+      }
+    }
+
+    return parts.join('\n');
   }
   return '';
 }

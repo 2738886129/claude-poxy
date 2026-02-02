@@ -12,7 +12,29 @@
       "Bash(if [ -f .env ])",
       "Bash(then)",
       "Bash(else)",
-      "Bash(fi)"
+      "Bash(fi)",
+      "Bash(claude --print:*)",
+      "WebFetch(domain:docs.claude.com)",
+      "Bash($env:CLAUDE_CODE_GIT_BASH_PATH = \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\")",
+      "Bash(Select-Object -First 20)",
+      "Bash(set CLAUDE_CODE_GIT_BASH_PATH=\"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\")",
+      "Bash(\"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\" -c \"claude --print --dangerously-skip-permissions\")",
+      "Bash(where:*)",
+      "Bash(set CLAUDE_CODE_GIT_BASH_PATH=D:Installed SoftwareGitbinbash.exe)",
+      "Bash(cmd /c \"set CLAUDE_CODE_GIT_BASH_PATH=D:\\\\Installed Software\\\\Git\\\\bin\\\\bash.exe && echo test | claude --print --dangerously-skip-permissions\")",
+      "Bash(findstr:*)",
+      "Bash(export CLAUDE_CODE_GIT_BASH_PATH=\"D:/Installed Software/Git/bin/bash.exe\")",
+      "Bash(CLAUDE_CODE_GIT_BASH_PATH=\"D:\\\\Installed Software\\\\Git\\\\bin\\\\bash.exe\")",
+      "Bash(export CLAUDE_CODE_GIT_BASH_PATH=\"/d/Installed Software/Git/bin/bash.exe\")",
+      "Bash(netstat:*)",
+      "Bash(taskkill:*)",
+      "Bash(cmd /c \"taskkill /PID 33088 /F\")",
+      "Bash(powershell -Command \"Stop-Process -Id 33088 -Force\")",
+      "Bash(powershell -Command:*)",
+      "Bash(dir:*)",
+      "Bash(tasklist:*)",
+      "Bash(curl -s \"http://10.143.202.249:3001/__proxy__/inject.js\")",
+      "Bash(curl:*)"
     ]
   }
 }

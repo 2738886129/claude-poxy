@@ -1,6 +1,10 @@
 {
-  "allowedChats": [
-    "d4331443-e598-45cf-b879-2f353dadd1d0"
-  ],
-  "allowedProjects": []
+  "key_107806c6a056": {
+    "allowedChats": [],
+    "allowedProjects": []
+  },
+  "key_4160abd8d37f": {
+    "allowedChats": [],
+    "allowedProjects": []
+  }
 }

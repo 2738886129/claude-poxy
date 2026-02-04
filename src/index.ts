@@ -122,54 +122,69 @@ if (SESSION_KEY) {
   });
 }
 
-// MCP Registry API 代理 - 解决 CORS 问题
-// 前端需要访问 api.anthropic.com/mcp-registry，但会遇到 CORS 限制
-// 通过代理服务器转发这些请求
+// Anthropic API 通用代理 - 解决 CORS 问题
+// 前端需要访问 api.anthropic.com 的各种 API，但会遇到 CORS 限制
+// 通过代理服务器转发这些请求（支持 MCP Registry、模型配置等）
 import https from 'https';
 
-app.get('/mcp-registry/*', (req, res) => {
-  const path = req.path; // 例如：/mcp-registry/v0/servers
-  const queryString = Object.keys(req.query).length > 0
-    ? '?' + new URLSearchParams(req.query as Record<string, string>).toString()
-    : '';
-  const fullPath = `${path}${queryString}`;
+// 创建通用的 API 代理处理函数
+function createAnthropicApiProxy() {
+  return (req: express.Request, res: express.Response) => {
+    const path = req.path;
+    const queryString = Object.keys(req.query).length > 0
+      ? '?' + new URLSearchParams(req.query as Record<string, string>).toString()
+      : '';
+    const fullPath = `${path}${queryString}`;
 
-  console.log(`[MCP Registry Proxy] 转发请求: https://api.anthropic.com${fullPath}`);
+    console.log(`[Anthropic API Proxy] 转发请求: https://api.anthropic.com${fullPath}`);
 
-  const options = {
-    hostname: 'api.anthropic.com',
-    path: fullPath,
-    method: req.method,
-    headers: {
-      'User-Agent': 'Claude-Proxy/1.0',
-      'Accept': 'application/json',
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: fullPath,
+      method: req.method,
+      headers: {
+        'User-Agent': 'Claude-Proxy/1.0',
+        'Accept': 'application/json',
+        'Content-Type': req.headers['content-type'] || 'application/json',
+      }
+    };
+
+    const proxyReq = https.request(options, (proxyRes) => {
+      // 设置 CORS 头，允许前端访问
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'application/json');
+
+      res.status(proxyRes.statusCode || 200);
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('[Anthropic API Proxy] 错误:', err.message);
+      res.status(500).json({ error: 'Anthropic API proxy error', message: err.message });
+    });
+
+    // 如果有请求体，转发它
+    if (req.body && Object.keys(req.body).length > 0) {
+      proxyReq.write(JSON.stringify(req.body));
     }
+
+    proxyReq.end();
   };
+}
 
-  const proxyReq = https.request(options, (proxyRes) => {
-    // 设置 CORS 头，允许前端访问
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'application/json');
+// MCP Registry API 代理
+app.get('/mcp-registry/*', createAnthropicApiProxy());
 
-    res.status(proxyRes.statusCode || 200);
-    proxyRes.pipe(res);
-  });
+// 其他可能的 Anthropic API 端点
+app.all('/v1/*', createAnthropicApiProxy());
 
-  proxyReq.on('error', (err) => {
-    console.error('[MCP Registry Proxy] 错误:', err.message);
-    res.status(500).json({ error: 'MCP Registry proxy error', message: err.message });
-  });
-
-  proxyReq.end();
-});
-
-// OPTIONS 预检请求
-app.options('/mcp-registry/*', (_req, res) => {
+// OPTIONS 预检请求（支持所有可能的 API 路径）
+app.options(['/mcp-registry/*', '/v1/*'], (_req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.status(204).end();
 });
 
@@ -727,6 +742,8 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           const originalFetch = window.fetch;
           window.fetch = function(input, init) {
             const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+
+            // 拦截被阻止的第三方服务
             if (isBlocked(url)) {
               console.log('[Proxy] 拦截第三方请求:', url);
               // 返回一个空的成功响应
@@ -736,6 +753,20 @@ app.get('/__proxy__/inject.js', (_req, res) => {
                 headers: new Headers({ 'Content-Type': 'application/json' })
               }));
             }
+
+            // 重定向 api.anthropic.com 请求到本地代理
+            if (url && url.includes('api.anthropic.com')) {
+              // 提取路径和查询参数
+              const apiUrl = new URL(url);
+              const proxyPath = apiUrl.pathname + apiUrl.search;
+              console.log('[Proxy] 重定向 API 请求到本地代理:', proxyPath);
+
+              // 重定向到本地代理路由
+              const newUrl = window.location.origin + proxyPath;
+              const newInput = typeof input === 'string' ? newUrl : new Request(newUrl, input);
+              return originalFetch.call(this, newInput, init);
+            }
+
             return originalFetch.apply(this, arguments);
           };
         } catch (e) {

@@ -1,5 +1,5 @@
 import { createProxyMiddleware } from 'http-proxy-middleware';
-import type { RequestHandler, Request } from 'express';
+import type { RequestHandler, Request, Response, NextFunction } from 'express';
 import type { ServerResponse } from 'http';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
@@ -472,66 +472,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
     on: {
       proxyReq: (proxyReq, req) => {
-        // 添加保护：检查请求状态，避免在已发送头部后修改
-        const isFinished = (proxyReq as any).finished;
-        const isHeadersSent = (proxyReq as any).headersSent;
-
-        if (isFinished || isHeadersSent) {
-          console.warn(`[Web Proxy] Skipping header modification for ${req.url} (finished: ${isFinished}, headersSent: ${isHeadersSent})`);
-          return;
-        }
-
         try {
           // 设置请求超时
           proxyReq.setTimeout(120000);
-          // 注入 sessionKey Cookie
-          const existingCookie = proxyReq.getHeader('cookie') as string || '';
-          const newCookie = existingCookie
-            ? `${existingCookie}; sessionKey=${sessionKey}`
-            : `sessionKey=${sessionKey}`;
-          proxyReq.setHeader('cookie', newCookie);
-
-          // 设置正确的 Host
-          proxyReq.setHeader('host', 'claude.ai');
-
-          // 移除可能暴露代理的头
-          proxyReq.removeHeader('x-forwarded-host');
-          proxyReq.removeHeader('x-forwarded-proto');
-          proxyReq.removeHeader('x-forwarded-for');
-          proxyReq.removeHeader('x-real-ip');
-          proxyReq.removeHeader('x-client-ip');
-          proxyReq.removeHeader('cf-connecting-ip');
-          proxyReq.removeHeader('true-client-ip');
-          proxyReq.removeHeader('via');
-
-          // 覆盖客户端浏览器指纹相关的请求头
-          proxyReq.setHeader('user-agent', SPOOFED_USER_AGENT);
-          proxyReq.setHeader('accept-language', SPOOFED_ACCEPT_LANGUAGE);
-          proxyReq.setHeader('sec-ch-ua', SPOOFED_SEC_CH_UA);
-          proxyReq.setHeader('sec-ch-ua-platform', SPOOFED_SEC_CH_UA_PLATFORM);
-          proxyReq.setHeader('sec-ch-ua-mobile', SPOOFED_SEC_CH_UA_MOBILE);
-
-          // 修正 referer 和 origin，避免暴露代理地址
-          const referer = proxyReq.getHeader('referer') as string;
-          if (referer) {
-            proxyReq.setHeader('referer', referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai'));
-          }
-          const origin = proxyReq.getHeader('origin') as string;
-          if (origin && !origin.includes('claude.ai')) {
-            proxyReq.setHeader('origin', 'https://claude.ai');
-          }
-
-          // 请求未压缩的响应
-          // 注意：压缩透传在某些环境下不兼容，暂时禁用
-          proxyReq.setHeader('accept-encoding', 'identity');
 
           console.log(`[Web Proxy] ${req.method} ${req.url}`);
         } catch (err: any) {
-          // 忽略 ERR_HTTP_HEADERS_SENT 错误，这在某些竞态条件下可能发生
-          if (err.code === 'ERR_HTTP_HEADERS_SENT') {
-            console.warn(`[Web Proxy] Headers already sent for ${req.url}, ignoring`);
-            return;
-          }
           console.error(`[Web Proxy] Error in proxyReq handler:`, err.message);
         }
       },
@@ -973,6 +919,46 @@ export function createWebProxy(sessionKey: string): RequestHandler {
     }
   });
 
-  // 直接返回代理中间件（缓存已禁用）
-  return proxyMiddleware;
+  // 返回包装后的中间件：先修改请求头，再调用代理
+  return (req: Request, res: Response, next: NextFunction) => {
+    // 在代理之前修改请求头
+    const existingCookie = req.headers.cookie || '';
+    const newCookie = existingCookie
+      ? `${existingCookie}; sessionKey=${sessionKey}`
+      : `sessionKey=${sessionKey}`;
+    req.headers.cookie = newCookie;
+
+    // 覆盖客户端浏览器指纹相关的请求头
+    req.headers['user-agent'] = SPOOFED_USER_AGENT;
+    req.headers['accept-language'] = SPOOFED_ACCEPT_LANGUAGE;
+    req.headers['sec-ch-ua'] = SPOOFED_SEC_CH_UA;
+    req.headers['sec-ch-ua-platform'] = SPOOFED_SEC_CH_UA_PLATFORM;
+    req.headers['sec-ch-ua-mobile'] = SPOOFED_SEC_CH_UA_MOBILE;
+
+    // 修正 referer 和 origin，避免暴露代理地址
+    const referer = req.headers.referer;
+    if (referer) {
+      req.headers.referer = referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai');
+    }
+    const origin = req.headers.origin;
+    if (origin && !origin.includes('claude.ai')) {
+      req.headers.origin = 'https://claude.ai';
+    }
+
+    // 请求未压缩的响应
+    req.headers['accept-encoding'] = 'identity';
+
+    // 移除可能暴露代理的头
+    delete req.headers['x-forwarded-host'];
+    delete req.headers['x-forwarded-proto'];
+    delete req.headers['x-forwarded-for'];
+    delete req.headers['x-real-ip'];
+    delete req.headers['x-client-ip'];
+    delete req.headers['cf-connecting-ip'];
+    delete req.headers['true-client-ip'];
+    delete req.headers['via'];
+
+    // 调用代理中间件（使用 any 避免类型冲突）
+    (proxyMiddleware as any)(req, res, next);
+  };
 }

@@ -82,56 +82,11 @@ export function createOptimizedWebProxy(
 
     on: {
       proxyReq: (proxyReq, req) => {
-        // 添加保护：检查请求状态，避免在已发送头部后修改
-        const isFinished = (proxyReq as any).finished;
-        const isHeadersSent = (proxyReq as any).headersSent;
-
-        if (isFinished || isHeadersSent) {
-          console.warn(`[Streaming Proxy] Skipping header modification for ${req.url} (finished: ${isFinished}, headersSent: ${isHeadersSent})`);
-          return;
-        }
-
         try {
           // 设置超时
           proxyReq.setTimeout(120000);
-
-          // 注入 sessionKey Cookie
-          const existingCookie = proxyReq.getHeader('cookie') as string || '';
-          const newCookie = existingCookie
-            ? `${existingCookie}; sessionKey=${sessionKey}`
-            : `sessionKey=${sessionKey}`;
-          proxyReq.setHeader('cookie', newCookie);
-
-          // 设置正确的 Host
-          proxyReq.setHeader('host', 'claude.ai');
-
-          // 移除可能暴露代理的头
-          proxyReq.removeHeader('x-forwarded-host');
-          proxyReq.removeHeader('x-forwarded-proto');
-          proxyReq.removeHeader('x-forwarded-for');
-          proxyReq.removeHeader('x-real-ip');
-          proxyReq.removeHeader('x-client-ip');
-          proxyReq.removeHeader('cf-connecting-ip');
-          proxyReq.removeHeader('true-client-ip');
-          proxyReq.removeHeader('via');
-
-          // 修正 referer 和 origin
-          const referer = proxyReq.getHeader('referer') as string;
-          if (referer) {
-            proxyReq.setHeader('referer', referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai'));
-          }
-          const origin = proxyReq.getHeader('origin') as string;
-          if (origin && !origin.includes('claude.ai')) {
-            proxyReq.setHeader('origin', 'https://claude.ai');
-          }
-
           console.log(`[Streaming Proxy] ${req.method} ${req.url}`);
         } catch (err: any) {
-          // 忽略 ERR_HTTP_HEADERS_SENT 错误，这在某些竞态条件下可能发生
-          if (err.code === 'ERR_HTTP_HEADERS_SENT') {
-            console.warn(`[Streaming Proxy] Headers already sent for ${req.url}, ignoring`);
-            return;
-          }
           console.error(`[Streaming Proxy] Error in proxyReq handler:`, err.message);
         }
       },
@@ -189,10 +144,38 @@ export function createOptimizedWebProxy(
     next();
   };
 
-  // 路由中间件：决定使用哪个代理
+  // 路由中间件：先修改请求头，再决定使用哪个代理
   return (req, res, next) => {
     const url = req.url || '';
     const method = req.method || 'GET';
+
+    // ===== 在代理之前修改请求头 =====
+    // 注入 sessionKey Cookie
+    const existingCookie = req.headers.cookie || '';
+    const newCookie = existingCookie
+      ? `${existingCookie}; sessionKey=${sessionKey}`
+      : `sessionKey=${sessionKey}`;
+    req.headers.cookie = newCookie;
+
+    // 修正 referer 和 origin，避免暴露代理地址
+    const referer = req.headers.referer;
+    if (referer) {
+      req.headers.referer = referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai');
+    }
+    const origin = req.headers.origin;
+    if (origin && !origin.includes('claude.ai')) {
+      req.headers.origin = 'https://claude.ai';
+    }
+
+    // 移除可能暴露代理的头
+    delete req.headers['x-forwarded-host'];
+    delete req.headers['x-forwarded-proto'];
+    delete req.headers['x-forwarded-for'];
+    delete req.headers['x-real-ip'];
+    delete req.headers['x-client-ip'];
+    delete req.headers['cf-connecting-ip'];
+    delete req.headers['true-client-ip'];
+    delete req.headers['via'];
 
     // 先检查缓存
     cacheMiddleware(req, res, () => {

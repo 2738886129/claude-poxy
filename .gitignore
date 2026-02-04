@@ -9,6 +9,11 @@ dist/
 .env.local
 .env.*.local
 
+# Sensitive configurations
+auth.json
+config.json
+fingerprint.json
+
 # Cache
 .cache/
 

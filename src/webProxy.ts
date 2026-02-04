@@ -8,22 +8,81 @@ import type { ApiKeyEntry } from './auth.js';
 
 const CLAUDE_WEB_URL = 'https://claude.ai';
 
-// 注入的脚本 - 关键 polyfill 必须内联执行,确保在 Claude 代码之前运行
-// 其他伪装代码仍然通过外部脚本加载
-// 管理员模式：仅注入必需的 crypto.randomUUID polyfill
-const ADMIN_MINIMAL_SCRIPT = `<script>
-// ========== 关键 polyfill: crypto.randomUUID ==========
-// 管理员模式：仅注入此 polyfill，不加载其他伪装脚本
-if (!crypto.randomUUID) {
-  crypto.randomUUID = function() {
-    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, function(c) {
-      return (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16);
-    });
+// 指纹配置接口
+interface FingerprintConfig {
+  userAgent: string;
+  platform: string;
+  language: string;
+  languages: string[];
+  hardwareConcurrency: number;
+  deviceMemory: number;
+  maxTouchPoints: number;
+  vendor: string;
+  appVersion: string;
+  screen: {
+    width: number;
+    height: number;
+    colorDepth: number;
+    pixelDepth: number;
+  };
+  timezone: string;
+  timezoneOffset: number;
+  secChUa: string;
+  secChUaPlatform: string;
+  secChUaMobile: string;
+  acceptLanguage: string;
+  webgl: {
+    vendor: string;
+    renderer: string;
+    extensions: string[];
   };
 }
-</script>`;
 
-// 普通模式：注入 polyfill + 加载伪装脚本
+// 加载指纹配置
+function loadFingerprint(): FingerprintConfig {
+  const fingerprintPath = join(process.cwd(), 'fingerprint.json');
+  if (existsSync(fingerprintPath)) {
+    try {
+      const content = readFileSync(fingerprintPath, 'utf-8');
+      const config = JSON.parse(content);
+      console.log('[Fingerprint] 已加载自定义浏览器指纹');
+      return config;
+    } catch (err) {
+      console.error('[Fingerprint] 读取指纹配置失败,使用默认配置:', err);
+    }
+  }
+  // 默认指纹配置(如果文件不存在)
+  return {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    platform: 'Win32',
+    language: 'en-US',
+    languages: ['en-US', 'en'],
+    hardwareConcurrency: 8,
+    deviceMemory: 8,
+    maxTouchPoints: 0,
+    vendor: 'Google Inc.',
+    appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    screen: { width: 1920, height: 1080, colorDepth: 24, pixelDepth: 24 },
+    timezone: 'Asia/Shanghai',
+    timezoneOffset: -480,
+    secChUa: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    secChUaPlatform: '"Windows"',
+    secChUaMobile: '?0',
+    acceptLanguage: 'en-US,en;q=0.9',
+    webgl: {
+      vendor: 'Google Inc. (NVIDIA)',
+      renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+      extensions: ['ANGLE_instanced_arrays', 'EXT_blend_minmax', 'WEBGL_debug_renderer_info']
+    }
+  };
+}
+
+// 全局指纹配置
+const FINGERPRINT = loadFingerprint();
+
+// 注入的脚本 - 关键 polyfill 必须内联执行,确保在 Claude 代码之前运行
+// 其他伪装代码仍然通过外部脚本加载
+// 所有模式都注入 polyfill + 加载伪装脚本
 const INJECT_SCRIPT = `<script>
 // ========== 关键 polyfill: crypto.randomUUID ==========
 // 必须在此内联,因为 Claude 的代码会立即使用
@@ -44,12 +103,15 @@ if (!crypto.randomUUID) {
 })();
 </script>`;
 
-// 伪装的浏览器信息 - 模拟一个通用的 Chrome 浏览器
-const SPOOFED_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const SPOOFED_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
-const SPOOFED_SEC_CH_UA = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
-const SPOOFED_SEC_CH_UA_PLATFORM = '"Windows"';
-const SPOOFED_SEC_CH_UA_MOBILE = '?0';
+// 从配置导出的浏览器信息常量
+const SPOOFED_USER_AGENT = FINGERPRINT.userAgent;
+const SPOOFED_ACCEPT_LANGUAGE = FINGERPRINT.acceptLanguage;
+const SPOOFED_SEC_CH_UA = FINGERPRINT.secChUa;
+const SPOOFED_SEC_CH_UA_PLATFORM = FINGERPRINT.secChUaPlatform;
+const SPOOFED_SEC_CH_UA_MOBILE = FINGERPRINT.secChUaMobile;
+
+// 导出指纹配置供其他模块使用
+export { FINGERPRINT };
 
 // 凭证级别的权限配置
 interface KeyPermissionConfig {
@@ -745,7 +807,6 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
         // 处理 HTML 响应，注入脚本
         if (contentType.includes('text/html')) {
-          const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
           const chunks: Buffer[] = [];
 
           proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -753,8 +814,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
             try {
               let htmlStr = Buffer.concat(chunks).toString('utf8');
 
-              // 选择注入脚本：管理员模式仅注入必需 polyfill，普通模式注入完整脚本
-              const scriptToInject = (keyEntry && keyEntry.isAdmin) ? ADMIN_MINIMAL_SCRIPT : INJECT_SCRIPT;
+              // 所有用户都注入指纹伪装脚本
+              // 通过设置全局变量告知脚本是否为管理员，管理员跳过UI隐藏
+              const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+              const isAdmin = keyEntry && keyEntry.isAdmin;
+              const adminFlagScript = `<script>window.__PROXY_IS_ADMIN__=${isAdmin ? 'true' : 'false'};</script>`;
+              const scriptToInject = adminFlagScript + INJECT_SCRIPT;
 
               // 在 <head> 后立即注入脚本
               // 注意: 这会导致 React hydration 警告 #418,但不影响功能

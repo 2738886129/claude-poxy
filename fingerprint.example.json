@@ -1,0 +1,51 @@
+{
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0",
+  "platform": "Win32",
+  "language": "zh-CN",
+  "languages": ["zh-CN", "zh", "en-US", "en"],
+  "hardwareConcurrency": 8,
+  "deviceMemory": 8,
+  "maxTouchPoints": 0,
+  "vendor": "Google Inc.",
+  "appVersion": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0",
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "colorDepth": 24,
+    "pixelDepth": 24
+  },
+  "timezone": "Asia/Shanghai",
+  "timezoneOffset": -480,
+  "secChUa": "\"Chromium\";v=\"144\", \"Microsoft Edge\";v=\"144\", \"Not_A Brand\";v=\"8\"",
+  "secChUaPlatform": "\"Windows\"",
+  "secChUaMobile": "?0",
+  "acceptLanguage": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+  "webgl": {
+    "vendor": "Google Inc. (NVIDIA)",
+    "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "extensions": [
+      "ANGLE_instanced_arrays",
+      "EXT_blend_minmax",
+      "EXT_color_buffer_half_float",
+      "EXT_float_blend",
+      "EXT_frag_depth",
+      "EXT_shader_texture_lod",
+      "EXT_texture_filter_anisotropic",
+      "OES_element_index_uint",
+      "OES_fbo_render_mipmap",
+      "OES_standard_derivatives",
+      "OES_texture_float",
+      "OES_texture_float_linear",
+      "OES_texture_half_float",
+      "OES_texture_half_float_linear",
+      "OES_vertex_array_object",
+      "WEBGL_color_buffer_float",
+      "WEBGL_compressed_texture_s3tc",
+      "WEBGL_debug_renderer_info",
+      "WEBGL_debug_shaders",
+      "WEBGL_depth_texture",
+      "WEBGL_draw_buffers",
+      "WEBGL_lose_context"
+    ]
+  }
+}

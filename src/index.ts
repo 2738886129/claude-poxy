@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { createWebProxy } from './webProxy.js';
+import { createWebProxy, FINGERPRINT } from './webProxy.js';
 import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
 import {
@@ -163,26 +163,24 @@ app.get('/__proxy__/inject.js', (_req, res) => {
 
       if (ENABLE_FINGERPRINT_SPOOFING) {
       // ========== 浏览器指纹伪装 ==========
-      // 伪装的浏览器信息 - 与服务端 HTTP 头保持一致
-      const SPOOFED = {
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        platform: 'Win32',
-        language: 'en-US',
-        languages: ['en-US', 'en'],
-        hardwareConcurrency: 8,
-        deviceMemory: 8,
-        maxTouchPoints: 0,
-        vendor: 'Google Inc.',
-        appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        // 屏幕信息
-        screenWidth: 1920,
-        screenHeight: 1080,
-        screenColorDepth: 24,
-        screenPixelDepth: 24,
-        // 时区
-        timezoneOffset: -480,
-        timezone: 'Asia/Shanghai'
-      };
+      // 伪装的浏览器信息 - 从服务端配置动态加载
+      const SPOOFED = ${JSON.stringify({
+        userAgent: FINGERPRINT.userAgent,
+        platform: FINGERPRINT.platform,
+        language: FINGERPRINT.language,
+        languages: FINGERPRINT.languages,
+        hardwareConcurrency: FINGERPRINT.hardwareConcurrency,
+        deviceMemory: FINGERPRINT.deviceMemory,
+        maxTouchPoints: FINGERPRINT.maxTouchPoints,
+        vendor: FINGERPRINT.vendor,
+        appVersion: FINGERPRINT.appVersion,
+        screenWidth: FINGERPRINT.screen.width,
+        screenHeight: FINGERPRINT.screen.height,
+        screenColorDepth: FINGERPRINT.screen.colorDepth,
+        screenPixelDepth: FINGERPRINT.screen.pixelDepth,
+        timezoneOffset: FINGERPRINT.timezoneOffset,
+        timezone: FINGERPRINT.timezone
+      })};
 
       // 伪装 navigator 属性
       const navigatorProps = {
@@ -346,19 +344,8 @@ app.get('/__proxy__/inject.js', (_req, res) => {
       } catch (e) {}
 
       // 伪装 WebGL 指纹 (必须在 Canvas 之前定义，因为 Canvas 会引用)
-      const SPOOFED_WEBGL = {
-        vendor: 'Google Inc. (NVIDIA)',
-        renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-        extensions: [
-          'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float',
-          'EXT_float_blend', 'EXT_frag_depth', 'EXT_shader_texture_lod',
-          'EXT_texture_filter_anisotropic', 'OES_element_index_uint', 'OES_fbo_render_mipmap',
-          'OES_standard_derivatives', 'OES_texture_float', 'OES_texture_float_linear',
-          'OES_texture_half_float', 'OES_texture_half_float_linear', 'OES_vertex_array_object',
-          'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_s3tc', 'WEBGL_debug_renderer_info',
-          'WEBGL_debug_shaders', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'
-        ]
-      };
+      // 从服务端配置动态加载
+      const SPOOFED_WEBGL = ${JSON.stringify(FINGERPRINT.webgl)};
 
       // 保存原始 getContext (Canvas 伪装需要引用)
       const originalGetContext = HTMLCanvasElement.prototype.getContext;
@@ -777,7 +764,13 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         }
       })();
 
-      // ========== UI 元素隐藏 ==========
+      // ========== UI 元素隐藏（仅非管理员） ==========
+      // 检查是否为管理员，管理员跳过UI隐藏
+      const isAdmin = window.__PROXY_IS_ADMIN__ === true;
+      if (isAdmin) {
+        console.log('[Proxy] 管理员模式，跳过UI隐藏');
+      } else {
+      // 普通用户执行UI隐藏
       function injectStyles() {
         if (document.getElementById('proxy-hide-styles')) return;
 
@@ -883,6 +876,7 @@ app.get('/__proxy__/inject.js', (_req, res) => {
       setupUrlObserver();
 
       setInterval(hideElements, 1000);
+      } // 结束非管理员UI隐藏代码块
     })();
   `);
 });

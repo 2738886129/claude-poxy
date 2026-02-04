@@ -7,8 +7,7 @@ import {
   loadAuthConfig,
   setAdminPassword,
   hasAdminPassword,
-  getFullApiKey,
-  KeyPermission
+  getFullApiKey
 } from '../auth.js';
 import { markKeyAsRevoked } from '../webProxy.js';
 
@@ -23,13 +22,9 @@ Claude Proxy 认证管理工具
   npm run auth <command> [options]
 
 命令:
-  create <name> [days] [perms]  创建新的 API Key
+  create <name> [days]          创建新的 API Key
                                 name: Key 名称
                                 days: Cookie 有效期（天），默认 7 天
-                                perms: 权限类型，可选值:
-                                  web  - 仅 Web 访问
-                                  api  - 仅 Claude Code API
-                                  all  - 两者都允许（默认）
   list                          列出所有 API Key
   show <id>                     显示指定 Key 的完整内容
   revoke <id>                   撤销指定的 API Key
@@ -40,10 +35,7 @@ Claude Proxy 认证管理工具
   help                          显示帮助信息
 
 示例:
-  npm run auth create "小明" 30         # 创建有效期 30 天的 Key（默认全部权限）
-  npm run auth create "网页用户" 7 web  # 仅允许 Web 访问
-  npm run auth create "开发者" 30 api   # 仅允许 Claude Code API
-  npm run auth create "VIP" 365 all     # 两者都允许
+  npm run auth create "小明" 30         # 创建有效期 30 天的 Key
   npm run auth show key_abc123          # 查看完整 Key
   npm run auth set-password             # 设置管理员密码
   npm run auth list
@@ -56,7 +48,7 @@ switch (command) {
     const name = args[1];
     if (!name) {
       console.error('错误: 请提供 API Key 名称');
-      console.error('用法: npm run auth create "名称" [有效期天数] [权限类型]');
+      console.error('用法: npm run auth create "名称" [有效期天数]');
       process.exit(1);
     }
 
@@ -71,24 +63,7 @@ switch (command) {
       expiresInDays = days;
     }
 
-    // 解析权限参数
-    let permissions: KeyPermission[] = ['web', 'api']; // 默认全部权限
-    if (args[3]) {
-      const permArg = args[3].toLowerCase();
-      if (permArg === 'web') {
-        permissions = ['web'];
-      } else if (permArg === 'api') {
-        permissions = ['api'];
-      } else if (permArg === 'all') {
-        permissions = ['web', 'api'];
-      } else {
-        console.error('错误: 无效的权限类型，可选值: web, api, all');
-        process.exit(1);
-      }
-    }
-
-    const { id, key } = createApiKey(name, expiresInDays, permissions);
-    const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join(' + ');
+    const { id, key } = createApiKey(name, expiresInDays);
     console.log('');
     console.log('========================================');
     console.log('  API Key 创建成功');
@@ -96,7 +71,6 @@ switch (command) {
     console.log(`  ID:     ${id}`);
     console.log(`  名称:   ${name}`);
     console.log(`  有效期: ${expiresInDays} 天`);
-    console.log(`  权限:   ${permStr}`);
     console.log(`  Key:    ${key}`);
     console.log('');
     console.log('  提示: 可随时通过管理面板或 CLI 查看完整 Key');
@@ -119,11 +93,10 @@ switch (command) {
       console.log(`当前共有 ${keys.length} 个 API Key:`);
       console.log('');
       for (const k of keys) {
-        const permStr = k.permissions.map(p => p === 'web' ? 'Web' : 'API').join(' + ');
+        const adminStr = k.isAdmin ? ' [管理员]' : '';
         console.log(`  ID:       ${k.id}`);
-        console.log(`  名称:     ${k.name}`);
+        console.log(`  名称:     ${k.name}${adminStr}`);
         console.log(`  前缀:     ${k.keyPrefix}`);
-        console.log(`  权限:     ${permStr}`);
         console.log(`  有效期:   ${k.expiresInDays || 7} 天`);
         console.log(`  创建时间: ${k.createdAt}`);
         console.log(`  最后使用: ${k.lastUsedAt || '从未使用'}`);

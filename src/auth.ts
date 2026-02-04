@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 // ===== 类型定义 =====
-export type KeyPermission = 'web' | 'api';  // web = 浏览器访问, api = Claude Code 访问
+export type KeyPermission = 'web';  // web = 浏览器访问
 
 export interface ApiKeyEntry {
   id: string;
@@ -15,7 +15,7 @@ export interface ApiKeyEntry {
   createdAt: string;
   lastUsedAt?: string;
   expiresInDays: number;     // Cookie 有效期（天）
-  permissions: KeyPermission[];  // 授权类型：web（浏览器）、api（Claude Code）
+  permissions: KeyPermission[];  // 授权类型：web（浏览器访问）
   isAdmin?: boolean;         // 是否为管理员凭证（可访问所有对话和项目，无脚本注入）
 }
 
@@ -120,7 +120,7 @@ export function hasAdminPassword(): boolean {
 export function createApiKey(
   name: string,
   expiresInDays: number = 7,
-  permissions: KeyPermission[] = ['web', 'api'],  // 默认两种权限都有
+  permissions: KeyPermission[] = ['web'],  // 默认 web 权限
   isAdmin: boolean = false  // 是否为管理员凭证
 ): { id: string; key: string } {
   const config = loadAuthConfig();
@@ -143,7 +143,7 @@ export function createApiKey(
   config.enabled = true;
   saveAuthConfig(config);
 
-  const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
+  const permStr = permissions.join('+');
   const adminStr = isAdmin ? ' [管理员]' : '';
   console.log(`[Auth] 创建 API Key: ${name} (${id}), 有效期: ${expiresInDays} 天, 权限: ${permStr}${adminStr}`);
   return { id, key };
@@ -167,7 +167,7 @@ export function updateApiKeyPermissions(id: string, permissions: KeyPermission[]
   if (entry) {
     entry.permissions = permissions;
     saveAuthConfig(config);
-    const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
+    const permStr = permissions.join('+');
     console.log(`[Auth] 更新 API Key 权限: ${id} -> ${permStr}`);
     return true;
   }
@@ -239,19 +239,13 @@ function extractApiKey(req: Request): string | null {
     return authHeader;
   }
 
-  // 2. 从 X-API-Key header 提取 (Claude Code 使用此 header)
-  const apiKeyHeader = req.headers['x-api-key'];
-  if (apiKeyHeader && typeof apiKeyHeader === 'string') {
-    return apiKeyHeader;
-  }
-
-  // 3. 从 X-Proxy-Key header 提取
+  // 2. 从 X-Proxy-Key header 提取
   const proxyKey = req.headers['x-proxy-key'];
   if (proxyKey && typeof proxyKey === 'string') {
     return proxyKey;
   }
 
-  // 4. 从 Cookie 提取
+  // 3. 从 Cookie 提取
   const cookies = req.headers.cookie;
   if (cookies) {
     const match = cookies.match(/proxy_key=([^;]+)/);
@@ -264,8 +258,7 @@ function extractApiKey(req: Request): string | null {
 }
 
 // ===== 中间件 =====
-// requiredPermission: 'web' = 浏览器访问, 'api' = Claude Code API 访问
-export function createAuthMiddleware(requiredPermission?: KeyPermission): RequestHandler {
+export function createAuthMiddleware(): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const config = loadAuthConfig();
 
@@ -276,62 +269,31 @@ export function createAuthMiddleware(requiredPermission?: KeyPermission): Reques
 
     const apiKey = extractApiKey(req);
 
-    // 判断是浏览器请求还是 API 请求
-    const acceptHeader = req.headers.accept || '';
-    const isApiRequest = req.path.startsWith('/v1/') ||
-                        acceptHeader.includes('application/json') ||
-                        req.headers['x-proxy-key'] !== undefined;
-
-    // 自动检测所需权限（如果未指定）
-    const permission = requiredPermission || (isApiRequest ? 'api' : 'web');
+    // 所有请求都需要 web 权限
+    const permission: KeyPermission = 'web';
 
     if (!apiKey) {
-      if (isApiRequest) {
-        console.log(`[Auth] 未提供 API Key: ${req.method} ${req.path}`);
-        return res.status(401).json({
-          error: 'Unauthorized',
-          message: 'API Key required. Use Authorization: Bearer <key> header.'
-        });
-      } else {
-        // 浏览器请求，重定向到登录页
-        return res.redirect('/__proxy__/login');
-      }
+      // 浏览器请求，重定向到登录页
+      return res.redirect('/__proxy__/login');
     }
 
     const keyEntry = validateApiKey(apiKey);
 
     if (!keyEntry) {
-      if (isApiRequest) {
-        console.log(`[Auth] 无效的 API Key: ${apiKey.substring(0, 12)}...`);
-        return res.status(401).json({
-          error: 'Unauthorized',
-          message: 'Invalid API Key'
-        });
-      } else {
-        // 浏览器请求，重定向到登录页并显示错误
-        return res.redirect('/__proxy__/login?error=invalid');
-      }
+      // 浏览器请求，重定向到登录页并显示错误
+      return res.redirect('/__proxy__/login?error=invalid');
     }
 
     // 检查权限
     const keyPermissions = keyEntry.permissions;
     if (!keyPermissions.includes(permission)) {
-      const permName = permission === 'web' ? 'Web 访问' : 'API 访问';
-      console.log(`[Auth] 权限不足: ${keyEntry.name} 没有 ${permName} 权限`);
-
-      if (isApiRequest) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: `This API Key does not have ${permission} permission`
-        });
-      } else {
-        return res.redirect('/__proxy__/login?error=no_permission');
-      }
+      console.log(`[Auth] 权限不足: ${keyEntry.name} 没有 Web 访问权限`);
+      return res.redirect('/__proxy__/login?error=no_permission');
     }
 
     // 将 key 信息附加到请求对象
     (req as any).apiKeyEntry = keyEntry;
-    console.log(`[Auth] 认证成功: ${keyEntry.name} (${permission})`);
+    console.log(`[Auth] 认证成功: ${keyEntry.name}`);
 
     next();
   };
@@ -447,8 +409,8 @@ export function getLoginPageHtml(error?: string): string {
 // ===== 管理员页面 HTML =====
 export function getAdminLoginHtml(message?: string): string {
   const isSuccess = message === 'password_changed';
+  const needsSetup = message === 'not_set';
   const displayMessage = message === 'invalid' ? '密码错误' :
-                         message === 'not_set' ? '管理员密码未设置，请先通过 CLI 设置' :
                          message === 'password_changed' ? '密码修改成功，请使用新密码登录' : '';
 
   return `<!DOCTYPE html>
@@ -479,15 +441,18 @@ export function getAdminLoginHtml(message?: string): string {
     .subtitle { text-align: center; color: #666; margin-bottom: 32px; font-size: 14px; }
     .form-group { margin-bottom: 24px; }
     label { display: block; margin-bottom: 8px; color: #333; font-weight: 500; }
-    input[type="password"] {
+    input[type="password"],
+    input[type="text"] {
       width: 100%;
       padding: 12px 16px;
       border: 2px solid #e1e1e1;
       border-radius: 8px;
       font-size: 16px;
+      transition: border-color 0.2s;
     }
+    .password-wrapper input { padding-right: 44px; }
     input:focus { outline: none; border-color: #1a1a2e; }
-    button {
+    button[type="submit"] {
       width: 100%;
       padding: 14px;
       background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
@@ -497,8 +462,10 @@ export function getAdminLoginHtml(message?: string): string {
       font-size: 16px;
       font-weight: 600;
       cursor: pointer;
+      transition: opacity 0.2s, transform 0.2s;
     }
-    button:hover { opacity: 0.9; }
+    button[type="submit"]:hover { opacity: 0.9; transform: translateY(-1px); }
+    button[type="submit"]:active { transform: translateY(0); }
     .message-box {
       padding: 12px;
       border-radius: 8px;
@@ -508,6 +475,86 @@ export function getAdminLoginHtml(message?: string): string {
     }
     .message-box.error { background: #fee2e2; color: #dc2626; }
     .message-box.success { background: #d1fae5; color: #065f46; }
+
+    /* Modal 样式 */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      animation: fadeIn 0.2s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    .modal {
+      background: white;
+      border-radius: 16px;
+      padding: 32px;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      animation: slideUp 0.3s ease;
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .modal h2 { text-align: center; color: #333; margin-bottom: 8px; font-size: 20px; }
+    .modal .subtitle { margin-bottom: 24px; }
+    .modal .form-group { margin-bottom: 16px; }
+    .modal .hint { font-size: 12px; color: #888; margin-top: 4px; }
+
+    /* Password toggle */
+    .password-wrapper { position: relative; display: block; }
+    .password-toggle {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #9ca3af;
+      padding: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
+    }
+    .password-toggle:hover { color: #6b7280; background: none; opacity: 1; transform: translateY(-50%); }
+
+    /* Toast 样式 */
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      padding: 14px 24px;
+      border-radius: 8px;
+      color: white;
+      font-size: 14px;
+      font-weight: 500;
+      z-index: 2000;
+      animation: toastIn 0.3s ease, toastOut 0.3s ease 2.7s forwards;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .toast.success { background: #10b981; }
+    .toast.error { background: #ef4444; }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateX(100%); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes toastOut {
+      from { opacity: 1; transform: translateX(0); }
+      to { opacity: 0; transform: translateX(100%); }
+    }
   </style>
 </head>
 <body>
@@ -515,49 +562,178 @@ export function getAdminLoginHtml(message?: string): string {
     <h1>管理员登录</h1>
     <p class="subtitle">请输入管理员密码</p>
     ${displayMessage ? `<div class="message-box ${isSuccess ? 'success' : 'error'}">${displayMessage}</div>` : ''}
-    <form method="POST" action="/login">
+    <form method="POST" action="/login" id="loginForm">
       <div class="form-group">
         <label for="password">密码</label>
-        <input type="password" id="password" name="password" required>
+        <div class="password-wrapper">
+          <input type="password" id="password" name="password" required>
+          <button type="button" class="password-toggle" onclick="togglePassword(this)">
+            <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+            <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+          </button>
+        </div>
       </div>
       <button type="submit">登录</button>
     </form>
+    <script>
+      function togglePassword(btn) {
+        var wrapper = btn.parentElement;
+        var input = wrapper.querySelector('input');
+        var eyeOpen = btn.querySelector('.eye-open');
+        var eyeClosed = btn.querySelector('.eye-closed');
+        if (input.type === 'password') {
+          input.type = 'text';
+          eyeOpen.style.display = 'none';
+          eyeClosed.style.display = 'block';
+        } else {
+          input.type = 'password';
+          eyeOpen.style.display = 'block';
+          eyeClosed.style.display = 'none';
+        }
+      }
+    </script>
   </div>
+
+  ${needsSetup ? `
+  <!-- 首次设置密码弹窗 -->
+  <div class="modal-overlay" id="setupModal">
+    <div class="modal">
+      <h2>🔐 设置管理员密码</h2>
+      <p class="subtitle" style="text-align:center;color:#666;">首次使用，请设置管理员密码</p>
+      <form id="setupForm">
+        <div class="form-group">
+          <label for="new_password">密码</label>
+          <div class="password-wrapper">
+            <input type="password" id="new_password" name="new_password" required minlength="6">
+            <button type="button" class="password-toggle" onclick="togglePasswordSetup(this)">
+              <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+              <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+            </button>
+          </div>
+          <div class="hint">至少 6 个字符</div>
+        </div>
+        <div class="form-group">
+          <label for="confirm_password">确认密码</label>
+          <div class="password-wrapper">
+            <input type="password" id="confirm_password" name="confirm_password" required minlength="6">
+            <button type="button" class="password-toggle" onclick="togglePasswordSetup(this)">
+              <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+              <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+            </button>
+          </div>
+        </div>
+        <button type="submit">设置密码</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    function togglePasswordSetup(btn) {
+      var wrapper = btn.parentElement;
+      var input = wrapper.querySelector('input');
+      var eyeOpen = btn.querySelector('.eye-open');
+      var eyeClosed = btn.querySelector('.eye-closed');
+      if (input.type === 'password') {
+        input.type = 'text';
+        eyeOpen.style.display = 'none';
+        eyeClosed.style.display = 'block';
+      } else {
+        input.type = 'password';
+        eyeOpen.style.display = 'block';
+        eyeClosed.style.display = 'none';
+      }
+    }
+
+    // Toast 提示函数
+    function showToast(message, type = 'success') {
+      const existing = document.querySelector('.toast');
+      if (existing) existing.remove();
+
+      const toast = document.createElement('div');
+      toast.className = 'toast ' + type;
+      toast.textContent = message;
+      document.body.appendChild(toast);
+
+      setTimeout(() => toast.remove(), 3000);
+    }
+
+    // 设置密码表单处理
+    document.getElementById('setupForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const newPwd = document.getElementById('new_password').value;
+      const confirmPwd = document.getElementById('confirm_password').value;
+
+      if (newPwd !== confirmPwd) {
+        showToast('两次输入的密码不一致', 'error');
+        return;
+      }
+
+      if (newPwd.length < 6) {
+        showToast('密码至少需要 6 个字符', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch('/setup-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'password=' + encodeURIComponent(newPwd)
+        });
+
+        const data = await res.json();
+
+        if (data.success) {
+          showToast('密码设置成功！', 'success');
+          document.getElementById('setupModal').style.display = 'none';
+          setTimeout(() => {
+            document.getElementById('password').focus();
+          }, 500);
+        } else {
+          showToast(data.message || '设置失败', 'error');
+        }
+      } catch (err) {
+        showToast('网络错误，请重试', 'error');
+      }
+    });
+  </script>
+  ` : ''}
 </body>
 </html>`;
 }
 
 export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[], message?: string): string {
-  const getPermissionBadges = (permissions: KeyPermission[]) => {
-    const badges = [];
-    if (permissions.includes('web')) badges.push('<span class="badge badge-web">Web</span>');
-    if (permissions.includes('api')) badges.push('<span class="badge badge-api">API</span>');
-    return badges.join(' ');
-  };
+  const isError = message?.includes('失败') || message?.includes('错误') || message?.includes('不能') || message?.includes('至少');
 
   const keyRows = keys.map(k => `
-    <tr>
-      <td>${k.name}</td>
+    <tr data-id="${k.id}">
       <td>
-        <code class="key-display">${k.fullKey}</code>
-        <button class="copy-btn" onclick="copyKey('${k.fullKey}')">复制</button>
+        <div class="name-cell">
+          <span class="key-name">${k.name}</span>
+          ${k.isAdmin ? '<span class="badge badge-admin">管理员</span>' : ''}
+        </div>
       </td>
       <td>
-        <form method="POST" action="/update-perm" style="display:inline" class="perm-form">
-          <input type="hidden" name="id" value="${k.id}">
-          <label class="perm-checkbox"><input type="checkbox" name="perm_web" value="1" ${k.permissions.includes('web') ? 'checked' : ''} onchange="this.form.submit()"> Web</label>
-          <label class="perm-checkbox"><input type="checkbox" name="perm_api" value="1" ${k.permissions.includes('api') ? 'checked' : ''} onchange="this.form.submit()"> API</label>
-        </form>
+        <div class="key-cell">
+          <code class="key-display">${k.fullKey}</code>
+          <button class="icon-btn copy-btn" onclick="copyKey('${k.fullKey}')" title="复制">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+          </button>
+        </div>
       </td>
-      <td>${k.isAdmin ? '<span class="badge" style="background:#fee2e2;color:#dc2626;">管理员</span>' : '<span class="badge" style="background:#e5e7eb;color:#4b5563;">普通</span>'}</td>
-      <td>${k.expiresInDays} 天</td>
-      <td>${new Date(k.createdAt).toLocaleString('zh-CN')}</td>
-      <td>${k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString('zh-CN') : '从未'}</td>
+      <td><span class="date-text">${k.expiresInDays} 天</span></td>
+      <td><span class="date-text">${new Date(k.createdAt).toLocaleDateString('zh-CN')}</span></td>
+      <td><span class="date-text ${!k.lastUsedAt ? 'muted' : ''}">${k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleDateString('zh-CN') : '从未'}</span></td>
       <td>
-        <form method="POST" action="/revoke" style="display:inline">
-          <input type="hidden" name="id" value="${k.id}">
-          <button type="submit" class="btn-danger" onclick="return confirm('确定要撤销此 Key 吗？')">撤销</button>
-        </form>
+        <button class="icon-btn danger" onclick="revokeKey('${k.id}', '${k.name}')" title="撤销">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+          </svg>
+        </button>
       </td>
     </tr>
   `).join('');
@@ -572,237 +748,412 @@ export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #f5f5f5;
+      background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%);
       min-height: 100vh;
-      padding: 20px;
+      padding: 24px;
     }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1000px; margin: 0 auto; }
+
+    /* Header */
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 30px;
-      padding: 20px;
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      margin-bottom: 24px;
+      padding: 20px 24px;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border-radius: 16px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
     }
-    h1 { font-size: 24px; color: #333; }
-    .logout-btn {
-      padding: 8px 16px;
-      background: #666;
+    header h1 {
+      font-size: 20px;
       color: white;
-      border: none;
-      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    header h1::before { content: '🔐'; font-size: 24px; }
+    .header-actions { display: flex; gap: 12px; align-items: center; }
+    .btn-secondary {
+      padding: 8px 16px;
+      background: rgba(255,255,255,0.1);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
       cursor: pointer;
       text-decoration: none;
-      font-size: 14px;
+      font-size: 13px;
+      transition: all 0.2s;
     }
+    .btn-secondary:hover { background: rgba(255,255,255,0.2); }
+
+    /* Cards */
     .card {
       background: white;
-      border-radius: 12px;
+      border-radius: 16px;
       padding: 24px;
       margin-bottom: 20px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      border: 1px solid rgba(0,0,0,0.05);
     }
-    .card h2 { font-size: 18px; margin-bottom: 20px; color: #333; }
-    .form-row { display: flex; gap: 12px; flex-wrap: wrap; }
-    .form-group { flex: 1; min-width: 150px; }
-    .form-group label { display: block; margin-bottom: 6px; font-size: 14px; color: #666; }
-    .form-group input, .form-group select {
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .card h2 { font-size: 16px; color: #333; display: flex; align-items: center; gap: 8px; }
+    .card h2 .count { background: #e5e7eb; color: #4b5563; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+
+    /* Form */
+    .form-row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+    .form-group { flex: 1; min-width: 140px; }
+    .form-group.small { flex: 0 0 100px; }
+    .form-group label { display: block; margin-bottom: 6px; font-size: 13px; color: #666; font-weight: 500; }
+    .form-group input[type="text"],
+    .form-group input[type="number"],
+    .form-group input[type="password"] {
       width: 100%;
-      padding: 10px 12px;
-      border: 1px solid #ddd;
-      border-radius: 6px;
+      padding: 10px 14px;
+      border: 1.5px solid #e5e7eb;
+      border-radius: 8px;
       font-size: 14px;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
+    .form-group input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1); }
+    .checkbox-group { display: flex; gap: 12px; align-items: center; padding: 8px 0; }
+    .checkbox-group label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; color: #333; margin-bottom: 0; }
+    .checkbox-group input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-color: #667eea; }
     .btn-primary {
-      padding: 10px 20px;
+      padding: 10px 24px;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       color: white;
       border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 14px;
-      font-weight: 500;
-    }
-    .btn-danger {
-      padding: 6px 12px;
-      background: #dc2626;
-      color: white;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
-    th { background: #f9f9f9; font-weight: 600; color: #666; font-size: 13px; }
-    td { font-size: 14px; }
-    .key-display {
-      font-family: monospace;
-      background: #f5f5f5;
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 12px;
-      user-select: all;
-    }
-    .copy-btn {
-      margin-left: 8px;
-      padding: 4px 8px;
-      background: #667eea;
-      color: white;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 11px;
-    }
-    .message {
-      padding: 12px 16px;
       border-radius: 8px;
-      margin-bottom: 20px;
+      cursor: pointer;
       font-size: 14px;
-    }
-    .message.success { background: #d1fae5; color: #065f46; }
-    .message.error { background: #fee2e2; color: #dc2626; }
-    .empty-state { text-align: center; padding: 40px; color: #888; }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 11px;
       font-weight: 500;
-      margin-right: 4px;
+      transition: transform 0.2s, box-shadow 0.2s;
     }
-    .badge-web { background: #dbeafe; color: #1d4ed8; }
-    .badge-api { background: #fef3c7; color: #b45309; }
-    .checkbox-group {
-      display: flex;
-      gap: 16px;
-      align-items: center;
-    }
-    .checkbox-group label {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-      font-size: 14px;
-    }
-    .checkbox-group input[type="checkbox"] {
-      width: 16px;
-      height: 16px;
-      cursor: pointer;
-    }
-    .perm-form { display: flex; gap: 12px; }
-    .perm-checkbox {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .perm-checkbox input { cursor: pointer; }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }
+    .btn-primary:active { transform: translateY(0); }
+    .hint { font-size: 11px; color: #888; margin-top: 4px; }
+
+    /* Table */
+    .table-wrapper { overflow-x: auto; margin: 0 -8px; padding: 0 8px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 14px 12px; text-align: left; }
+    th { background: #f9fafb; font-weight: 600; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #e5e7eb; }
+    td { font-size: 14px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }
+    tr:hover { background: #f9fafb; }
+    tr:last-child td { border-bottom: none; }
+
+    /* Key display */
+    .key-cell { display: flex; align-items: center; gap: 8px; }
+    .key-display { font-family: 'SF Mono', Monaco, 'Courier New', monospace; background: #f3f4f6; padding: 6px 10px; border-radius: 6px; font-size: 12px; color: #374151; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .name-cell { display: flex; align-items: center; gap: 8px; }
+    .key-name { font-weight: 500; color: #1f2937; }
+    .date-text { color: #6b7280; font-size: 13px; }
+    .date-text.muted { color: #9ca3af; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+    .badge-admin { background: linear-gradient(135deg, #fef3c7, #fde68a); color: #92400e; }
+
+    /* Icon buttons */
+    .icon-btn { width: 32px; height: 32px; border: none; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; background: #f3f4f6; color: #6b7280; }
+    .icon-btn:hover { background: #e5e7eb; color: #374151; }
+    .icon-btn.copy-btn:hover { background: #eff6ff; color: #2563eb; }
+    .icon-btn.danger:hover { background: #fef2f2; color: #dc2626; }
+
+    /* Empty state */
+    .empty-state { text-align: center; padding: 48px 20px; color: #9ca3af; }
+    .empty-state svg { margin-bottom: 16px; opacity: 0.5; }
+    .empty-state p { font-size: 14px; }
+
+    /* Toast */
+    .toast-container { position: fixed; top: 20px; right: 20px; z-index: 2000; display: flex; flex-direction: column; gap: 8px; }
+    .toast { padding: 14px 20px; border-radius: 10px; color: white; font-size: 14px; font-weight: 500; box-shadow: 0 4px 20px rgba(0,0,0,0.15); animation: toastIn 0.3s ease; display: flex; align-items: center; gap: 10px; }
+    .toast.success { background: linear-gradient(135deg, #10b981, #059669); }
+    .toast.error { background: linear-gradient(135deg, #ef4444, #dc2626); }
+    .toast.hiding { animation: toastOut 0.3s ease forwards; }
+    @keyframes toastIn { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes toastOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100%); } }
+
+    /* Modal */
+    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.5); display: none; align-items: center; justify-content: center; z-index: 1000; }
+    .modal-overlay.show { display: flex; }
+    .modal { background: white; border-radius: 16px; padding: 28px; width: 100%; max-width: 420px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); animation: modalIn 0.3s ease; }
+    @keyframes modalIn { from { opacity: 0; transform: scale(0.95) translateY(10px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .modal-header h3 { font-size: 18px; color: #1f2937; display: flex; align-items: center; gap: 8px; }
+    .modal-close { width: 32px; height: 32px; border: none; background: #f3f4f6; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; color: #6b7280; transition: all 0.2s; }
+    .modal-close:hover { background: #e5e7eb; color: #374151; }
+    .modal-body { margin-bottom: 24px; }
+    .modal-body .form-group { margin-bottom: 16px; }
+    .modal-body .form-group:last-child { margin-bottom: 0; }
+    .modal-footer { display: flex; gap: 12px; justify-content: flex-end; }
+    .btn-cancel { padding: 10px 20px; background: #f3f4f6; color: #374151; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; transition: background 0.2s; }
+
+    /* Password input with toggle */
+    .password-wrapper { position: relative; }
+    .password-wrapper input { padding-right: 40px; }
+    .password-toggle { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: #9ca3af; padding: 4px; display: flex; align-items: center; justify-content: center; }
+    .password-toggle:hover { color: #6b7280; }
+    .btn-cancel:hover { background: #e5e7eb; }
+    .confirm-message { font-size: 14px; color: #4b5563; line-height: 1.6; margin-bottom: 8px; }
+    .confirm-warning { font-size: 13px; color: #dc2626; background: #fef2f2; padding: 10px 12px; border-radius: 8px; }
+    .btn-danger { padding: 10px 20px; background: linear-gradient(135deg, #ef4444, #dc2626); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; transition: transform 0.2s, box-shadow 0.2s; }
+    .btn-danger:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(220, 38, 38, 0.4); }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
       <h1>API Key 管理面板</h1>
-      <a href="/logout" class="logout-btn">退出登录</a>
+      <div class="header-actions">
+        <button class="btn-secondary" onclick="showPasswordModal()">🔑 修改密码</button>
+        <a href="/logout" class="btn-secondary">退出登录</a>
+      </div>
     </header>
 
-    ${message ? `<div class="message success">${message}</div>` : ''}
-
     <div class="card">
-      <h2>创建新 Key</h2>
+      <div class="card-header"><h2>➕ 创建新 Key</h2></div>
       <form method="POST" action="/create">
-        <div class="form-row">
-          <div class="form-group">
+        <div class="form-row" style="margin-bottom: 16px;">
+          <div class="form-group" style="flex: 2;">
             <label>名称</label>
             <input type="text" name="name" placeholder="例如：小明的电脑" required>
           </div>
-          <div class="form-group">
+          <div class="form-group" style="flex: 1; min-width: 120px;">
             <label>有效期（天）</label>
             <input type="number" name="days" value="7" min="1" max="3650" required>
           </div>
-          <div class="form-group">
-            <label>授权类型</label>
-            <div class="checkbox-group">
-              <label><input type="checkbox" name="perm_web" value="1" checked> Web 访问</label>
-              <label><input type="checkbox" name="perm_api" value="1" checked> Claude Code</label>
+        </div>
+        <div class="form-row" style="align-items: center;">
+          <div class="form-group" style="flex: 1;">
+            <div class="checkbox-group" style="padding: 0;">
+              <label><input type="checkbox" name="isAdmin"> 管理员权限</label>
+              <span class="hint" style="margin-left: 8px; margin-top: 0;">（可访问全部内容，无脚本注入）</span>
             </div>
           </div>
-          <div class="form-group">
-            <label>管理员权限</label>
-            <div class="checkbox-group">
-              <label><input type="checkbox" name="isAdmin"> 管理员凭证</label>
-            </div>
-            <small style="color:#666;font-size:12px;display:block;margin-top:4px;">管理员可访问所有对话和项目,无脚本注入</small>
-          </div>
-          <div class="form-group" style="display:flex;align-items:flex-end;">
-            <button type="submit" class="btn-primary">创建</button>
+          <div class="form-group" style="flex: 0;">
+            <button type="submit" class="btn-primary">创建 Key</button>
           </div>
         </div>
       </form>
     </div>
 
     <div class="card">
-      <h2>已有 Key（${keys.length} 个）</h2>
+      <div class="card-header"><h2>📋 已有 Key <span class="count">${keys.length}</span></h2></div>
       ${keys.length === 0 ? `
-        <div class="empty-state">暂无 API Key，请创建一个</div>
+        <div class="empty-state">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+          </svg>
+          <p>暂无 API Key，请创建一个</p>
+        </div>
       ` : `
-        <table>
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>Key</th>
-              <th>权限</th>
-              <th>角色</th>
-              <th>有效期</th>
-              <th>创建时间</th>
-              <th>最后使用</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${keyRows}
-          </tbody>
-        </table>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>Key</th>
+                <th>有效期</th>
+                <th>创建时间</th>
+                <th>最后使用</th>
+                <th style="width:50px;"></th>
+              </tr>
+            </thead>
+            <tbody>${keyRows}</tbody>
+          </table>
+        </div>
       `}
     </div>
+  </div>
 
-    <div class="card">
-      <h2>修改管理员密码</h2>
-      <form method="POST" action="/change-password">
-        <div class="form-row">
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- 修改密码弹窗 -->
+  <div class="modal-overlay" id="passwordModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>🔑 修改管理员密码</h3>
+        <button class="modal-close" onclick="hidePasswordModal()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <form id="passwordForm" method="POST" action="/change-password">
+        <div class="modal-body">
           <div class="form-group">
             <label>当前密码</label>
-            <input type="password" name="current_password" required>
+            <div class="password-wrapper">
+              <input type="password" name="current_password" required>
+              <button type="button" class="password-toggle" onclick="togglePassword(this)">
+                <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+              </button>
+            </div>
           </div>
           <div class="form-group">
             <label>新密码</label>
-            <input type="password" name="new_password" required minlength="6">
+            <div class="password-wrapper">
+              <input type="password" name="new_password" required minlength="6">
+              <button type="button" class="password-toggle" onclick="togglePassword(this)">
+                <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+              </button>
+            </div>
+            <span class="hint">至少 6 个字符</span>
           </div>
           <div class="form-group">
             <label>确认新密码</label>
-            <input type="password" name="confirm_password" required minlength="6">
+            <div class="password-wrapper">
+              <input type="password" name="confirm_password" required minlength="6">
+              <button type="button" class="password-toggle" onclick="togglePassword(this)">
+                <svg class="eye-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <svg class="eye-closed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+              </button>
+            </div>
           </div>
-          <div class="form-group" style="display:flex;align-items:flex-end;">
-            <button type="submit" class="btn-primary">修改密码</button>
-          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-cancel" onclick="hidePasswordModal()">取消</button>
+          <button type="submit" class="btn-primary">确认修改</button>
         </div>
       </form>
     </div>
   </div>
 
+  <!-- 确认撤销弹窗 -->
+  <div class="modal-overlay" id="revokeModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>⚠️ 确认撤销</h3>
+        <button class="modal-close" onclick="hideRevokeModal()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="confirm-message">确定要撤销 Key "<span id="revokeKeyName"></span>" 吗？</p>
+        <p class="confirm-warning">此操作无法撤销，使用此 Key 的用户将立即失去访问权限。</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn-cancel" onclick="hideRevokeModal()">取消</button>
+        <form id="revokeForm" method="POST" action="/revoke" style="margin:0;">
+          <input type="hidden" name="id" id="revokeKeyId">
+          <button type="submit" class="btn-danger">确认撤销</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <script>
-    function copyKey(key) {
-      navigator.clipboard.writeText(key).then(() => {
-        alert('已复制到剪贴板');
-      }).catch(() => {
-        prompt('请手动复制:', key);
-      });
+    function showToast(message, type) {
+      type = type || 'success';
+      var container = document.getElementById('toastContainer');
+      var toast = document.createElement('div');
+      toast.className = 'toast ' + type;
+      var icons = { success: '✓', error: '✕' };
+      toast.innerHTML = '<span>' + (icons[type] || '') + '</span><span>' + message + '</span>';
+      container.appendChild(toast);
+      setTimeout(function() {
+        toast.classList.add('hiding');
+        setTimeout(function() { toast.remove(); }, 300);
+      }, 3000);
     }
+
+    ${message ? `showToast('${message.replace(/'/g, "\\'")}', '${isError ? 'error' : 'success'}');` : ''}
+
+    function copyKey(key) {
+      // 使用 fallback 方法支持非 HTTPS 环境
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(key).then(function() {
+          showToast('已复制到剪贴板', 'success');
+        }).catch(function() {
+          fallbackCopy(key);
+        });
+      } else {
+        fallbackCopy(key);
+      }
+    }
+
+    function fallbackCopy(text) {
+      var textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      textArea.style.top = '-9999px';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      try {
+        var successful = document.execCommand('copy');
+        if (successful) {
+          showToast('已复制到剪贴板', 'success');
+        } else {
+          showToast('复制失败，请手动复制', 'error');
+        }
+      } catch (err) {
+        showToast('复制失败，请手动复制', 'error');
+      }
+      document.body.removeChild(textArea);
+    }
+
+    function togglePassword(btn) {
+      var wrapper = btn.parentElement;
+      var input = wrapper.querySelector('input');
+      var eyeOpen = btn.querySelector('.eye-open');
+      var eyeClosed = btn.querySelector('.eye-closed');
+      if (input.type === 'password') {
+        input.type = 'text';
+        eyeOpen.style.display = 'none';
+        eyeClosed.style.display = 'block';
+      } else {
+        input.type = 'password';
+        eyeOpen.style.display = 'block';
+        eyeClosed.style.display = 'none';
+      }
+    }
+
+    function revokeKey(id, name) {
+      document.getElementById('revokeKeyId').value = id;
+      document.getElementById('revokeKeyName').textContent = name;
+      document.getElementById('revokeModal').classList.add('show');
+    }
+
+    function hideRevokeModal() {
+      document.getElementById('revokeModal').classList.remove('show');
+    }
+
+    function showPasswordModal() {
+      document.getElementById('passwordModal').classList.add('show');
+      document.getElementById('passwordForm').reset();
+    }
+
+    function hidePasswordModal() {
+      document.getElementById('passwordModal').classList.remove('show');
+    }
+
+    document.getElementById('passwordForm').addEventListener('submit', function(e) {
+      var newPwd = this.new_password.value;
+      var confirmPwd = this.confirm_password.value;
+      if (newPwd !== confirmPwd) {
+        e.preventDefault();
+        showToast('两次输入的密码不一致', 'error');
+        return false;
+      }
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') {
+        hidePasswordModal();
+        hideRevokeModal();
+      }
+    });
+
+    document.querySelectorAll('.modal-overlay').forEach(function(overlay) {
+      overlay.addEventListener('click', function(e) {
+        if (e.target === overlay) overlay.classList.remove('show');
+      });
+    });
   </script>
 </body>
 </html>`;

@@ -1,11 +1,9 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import { existsSync, readFileSync } from 'fs';
-import { homedir } from 'os';
 import { join } from 'path';
 import { createWebProxy, FINGERPRINT } from './webProxy.js';
 import { createOptimizedWebProxy } from './webProxy.optimized.js';
-// import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
 import {
   createAuthMiddleware,
@@ -33,24 +31,8 @@ function loadConfig(): { allowedChats: string[]; allowedProjects: string[] } {
 // 加载环境变量
 dotenv.config();
 
-// 检查本机 claude 是否已登录
-function checkClaudeLogin(): void {
-  const defaultPath = join(homedir(), '.claude', '.credentials.json');
-  const credentialsPath = process.env.CLAUDE_CREDENTIALS_PATH || defaultPath;
-
-  if (!existsSync(credentialsPath)) {
-    console.error('错误: 本机 Claude Code 未登录');
-    console.error('请先运行 "claude" 命令登录 Claude Max 账号');
-    process.exit(1);
-  }
-  console.log('✓ 检测到本机 Claude Code 已登录');
-}
-
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SESSION_KEY = process.env.CLAUDE_SESSION_KEY;
-
-// 检查登录状态
-checkClaudeLogin();
 
 const app = express();
 
@@ -906,11 +888,6 @@ app.post('/__proxy__/cache/clear', (_req, res) => {
   res.json({ success: true, message: '缓存已清空' });
 });
 
-// Claude Code API 代理 - 已禁用
-// 如需启用，取消下面两行的注释
-// app.post('/v1/messages', createAuthMiddleware(), createCliProxy());
-// app.post('/v1/messages/count_tokens', createAuthMiddleware(), createTokenCountHandler());
-
 // 启动服务器
 const mainServer = app.listen(PORT, '0.0.0.0', () => {
   const cache = getCache();
@@ -922,7 +899,6 @@ const mainServer = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  本地访问: http://localhost:${PORT}`);
   console.log(`  局域网访问: http://<你的IP>:${PORT}`);
   console.log('');
-  console.log('  Claude Code 代理: /v1/messages -> 本机 claude CLI');
   if (SESSION_KEY) {
     console.log('  Web 代理: /* -> claude.ai');
   }

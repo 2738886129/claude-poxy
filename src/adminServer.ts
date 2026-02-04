@@ -7,9 +7,7 @@ import {
   getAdminDashboardHtml,
   listApiKeysWithFullKey,
   createApiKey,
-  revokeApiKey,
-  updateApiKeyPermissions,
-  KeyPermission
+  revokeApiKey
 } from './auth.js';
 
 const ADMIN_PORT = parseInt(process.env.ADMIN_PORT || '3002', 10);
@@ -32,7 +30,29 @@ export function startAdminServer(): Server {
     }
 
     const error = req.query.error as string | undefined;
-    res.type('html').send(getAdminLoginHtml(error));
+    const message = req.query.message as string | undefined;
+    res.type('html').send(getAdminLoginHtml(error || message));
+  });
+
+  // 首次设置密码 API（仅在未设置密码时可用）
+  app.use('/setup-password', express.urlencoded({ extended: false }));
+  app.use('/setup-password', express.json());
+  app.post('/setup-password', (req, res) => {
+    // 如果已经有密码，拒绝请求
+    if (hasAdminPassword()) {
+      return res.status(403).json({ success: false, message: '管理员密码已设置' });
+    }
+
+    const password = req.body.password;
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({ success: false, message: '密码至少需要 6 个字符' });
+    }
+
+    setAdminPassword(password);
+    console.log('[Admin] 管理员密码首次设置成功');
+
+    res.json({ success: true, message: '密码设置成功' });
   });
 
   // 管理员登录处理
@@ -88,11 +108,6 @@ export function startAdminServer(): Server {
     const name = req.body.name;
     const days = parseInt(req.body.days, 10) || 7;
 
-    // 解析权限
-    const permissions: KeyPermission[] = [];
-    if (req.body.perm_web) permissions.push('web');
-    if (req.body.perm_api) permissions.push('api');
-
     // 解析是否为管理员
     const isAdmin = req.body.isAdmin === 'on';
 
@@ -100,14 +115,9 @@ export function startAdminServer(): Server {
       return res.redirect('/dashboard?message=名称不能为空');
     }
 
-    if (permissions.length === 0) {
-      return res.redirect('/dashboard?message=请至少选择一种授权类型');
-    }
-
-    createApiKey(name, days, permissions, isAdmin);
-    const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
+    createApiKey(name, days, ['web'], isAdmin);
     const adminStr = isAdmin ? ' [管理员]' : '';
-    res.redirect(`/dashboard?message=Key "${name}" 创建成功 (${permStr}${adminStr})`);
+    res.redirect(`/dashboard?message=Key "${name}" 创建成功${adminStr}`);
   });
 
   // 撤销 Key（管理员操作）
@@ -123,31 +133,6 @@ export function startAdminServer(): Server {
       res.redirect('/dashboard?message=Key 已撤销');
     } else {
       res.redirect('/dashboard?message=撤销失败');
-    }
-  });
-
-  // 更新权限（管理员操作）
-  app.use('/update-perm', express.urlencoded({ extended: false }));
-  app.post('/update-perm', (req, res) => {
-    const adminCookie = req.headers.cookie?.match(/admin_session=([^;]+)/);
-    if (!adminCookie || adminCookie[1] !== 'authenticated') {
-      return res.redirect('/');
-    }
-
-    const id = req.body.id;
-    const permissions: KeyPermission[] = [];
-    if (req.body.perm_web) permissions.push('web');
-    if (req.body.perm_api) permissions.push('api');
-
-    if (permissions.length === 0) {
-      return res.redirect('/dashboard?message=至少需要一种权限');
-    }
-
-    if (id && updateApiKeyPermissions(id, permissions)) {
-      const permStr = permissions.map(p => p === 'web' ? 'Web' : 'API').join('+');
-      res.redirect(`/dashboard?message=权限已更新为 ${permStr}`);
-    } else {
-      res.redirect('/dashboard?message=权限更新失败');
     }
   });
 

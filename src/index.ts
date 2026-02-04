@@ -153,17 +153,31 @@ if (SESSION_KEY) {
   // 排除内部路径
   app.use((req, res, next) => {
     const path = req.path;
+
     // 这些路径由其他中间件处理，跳过 Web 代理
     if (path.startsWith('/__proxy__/') || path.startsWith('/mcp-registry/') || path.startsWith('/v1/')) {
       return next();
     }
 
+    // 服务器端拦截非核心功能请求，减轻服务器负担
+    const blockedPaths = [
+      '/sentry',                      // Sentry 错误上报
+      '/sync/mcp/drive/',             // Google Drive 集成
+      '/model_configs/claude-3-5-haiku-latest' // 不存在的模型
+    ];
+
+    // 检查是否是被阻止的路径
+    if (blockedPaths.some(blocked => path.includes(blocked))) {
+      // 返回空 JSON 响应
+      return res.status(200).json({});
+    }
+
     // 拦截第三方服务请求（Sentry 错误上报、Intercom 客服等）
-    // 这些服务对 Claude 核心功能无影响，拦截可减少控制台噪音
     const blockedDomains = [
       'sentry.io',           // Sentry 错误追踪
       'api-iam.intercom.io', // Intercom 客服聊天
-      'intercom.io'          // Intercom 相关
+      'intercom.io',         // Intercom 相关
+      'statsig.com'          // Statsig 分析
     ];
 
     const referer = req.get('referer') || '';
@@ -711,12 +725,16 @@ app.get('/__proxy__/inject.js', (_req, res) => {
           'intercom.io',
           'intercom.com',
           'api-iam.intercom.io',
-          'widget.intercom.io'
+          'widget.intercom.io',
+          'statsig.com',              // Statsig 分析服务
+          'events.statsigapi.net'     // Statsig 事件上报
         ];
 
         const blockedPaths = [
-          '/sentry?',  // Sentry 错误上报路径
-          '/sentry/'
+          '/sentry?',                 // Sentry 错误上报
+          '/sentry/',
+          '/sync/mcp/drive/',         // Google Drive 集成（非必需）
+          '/model_configs/claude-3-5-haiku-latest', // 不存在的模型
         ];
 
         const isBlocked = (url) => {
@@ -728,7 +746,7 @@ app.get('/__proxy__/inject.js', (_req, res) => {
             return true;
           }
 
-          // 检查路径（用于代理内的 Sentry 请求）
+          // 检查路径（用于代理内的请求）
           if (blockedPaths.some(path => urlStr.includes(path))) {
             return true;
           }
@@ -753,7 +771,22 @@ app.get('/__proxy__/inject.js', (_req, res) => {
               }));
             }
 
-            // 重定向 api.anthropic.com 请求到本地代理
+            // 拦截无用的遥测/分析请求
+            if (url && (
+              url.includes('/v1/t') ||   // 遥测 (telemetry)
+              url.includes('/v1/p') ||   // 性能/点击 (performance/ping)
+              url.includes('/v1/m') ||   // 指标 (metrics)
+              url.includes('/v1/i')      // 展示/曝光 (impression)
+            )) {
+              // 静默拦截，返回成功响应
+              return Promise.resolve(new Response('{}', {
+                status: 200,
+                statusText: 'OK',
+                headers: new Headers({ 'Content-Type': 'application/json' })
+              }));
+            }
+
+            // 重定向其他 api.anthropic.com 请求到本地代理（如 MCP Registry）
             if (url && url.includes('api.anthropic.com')) {
               // 提取路径和查询参数
               const apiUrl = new URL(url);

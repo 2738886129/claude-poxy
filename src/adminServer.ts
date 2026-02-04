@@ -2,6 +2,7 @@ import express from 'express';
 import {
   hasAdminPassword,
   verifyAdminPassword,
+  setAdminPassword,
   getAdminLoginHtml,
   getAdminDashboardHtml,
   listApiKeysWithFullKey,
@@ -150,9 +151,42 @@ export function startAdminServer(): Server {
     }
   });
 
-  // 启动管理服务器
-  const server = app.listen(ADMIN_PORT, '127.0.0.1', () => {
-    console.log(`[Admin] 管理面板已启动: http://localhost:${ADMIN_PORT}`);
+  // 修改管理员密码
+  app.use('/change-password', express.urlencoded({ extended: false }));
+  app.post('/change-password', (req, res) => {
+    const adminCookie = req.headers.cookie?.match(/admin_session=([^;]+)/);
+    if (!adminCookie || adminCookie[1] !== 'authenticated') {
+      return res.redirect('/');
+    }
+
+    const { current_password, new_password, confirm_password } = req.body;
+
+    // 验证当前密码
+    if (!verifyAdminPassword(current_password)) {
+      return res.redirect('/dashboard?message=当前密码错误');
+    }
+
+    // 验证新密码
+    if (!new_password || new_password.length < 6) {
+      return res.redirect('/dashboard?message=新密码至少需要6个字符');
+    }
+
+    if (new_password !== confirm_password) {
+      return res.redirect('/dashboard?message=两次输入的新密码不一致');
+    }
+
+    // 更新密码
+    setAdminPassword(new_password);
+    console.log('[Admin] 管理员密码已修改');
+
+    // 清除会话，要求重新登录
+    res.clearCookie('admin_session');
+    res.redirect('/?message=password_changed');
+  });
+
+  // 启动管理服务器（允许远程访问）
+  const server = app.listen(ADMIN_PORT, '0.0.0.0', () => {
+    console.log(`[Admin] 管理面板已启动: http://0.0.0.0:${ADMIN_PORT} (允许远程访问)`);
   });
 
   return server;

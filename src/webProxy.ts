@@ -3,22 +3,42 @@ import type { RequestHandler, Request } from 'express';
 import type { ServerResponse } from 'http';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { Transform, TransformCallback } from 'stream';
 // import { getCache } from './staticCache.js'; // 缓存已禁用
 import type { ApiKeyEntry } from './auth.js';
 import https from 'https';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const CLAUDE_WEB_URL = 'https://claude.ai';
 
+// 代理配置（仅从 .env 的 PROXY_URL 读取）
+const PROXY_URL = process.env.PROXY_URL || '';
+
 // 创建共享的 HTTPS Agent，启用 Keep-Alive
-// 这可以显著提升性能，复用 TCP 连接
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 1000,
-  maxSockets: 256,
-  maxFreeSockets: 256,
-  timeout: 120000,
-  scheduling: 'lifo' // 后进先出，提高热连接复用率
-});
+// 如果配置了代理，使用 HttpsProxyAgent；否则直连
+const httpsAgent = PROXY_URL
+  ? new HttpsProxyAgent(PROXY_URL, {
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 256,
+      maxFreeSockets: 256,
+      timeout: 120000,
+    })
+  : new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 256,
+      maxFreeSockets: 256,
+      timeout: 120000,
+      scheduling: 'lifo' // 后进先出，提高热连接复用率
+    });
+
+// 启动时打印代理状态
+if (PROXY_URL) {
+  console.log(`[Web Proxy] 使用代理: ${PROXY_URL}`);
+} else {
+  console.log('[Web Proxy] 直连模式（未配置 PROXY_URL）');
+}
 
 // 指纹配置接口
 interface FingerprintConfig {
@@ -114,6 +134,77 @@ if (!crypto.randomUUID) {
   (document.head||document.documentElement).appendChild(s);
 })();
 </script>`;
+
+// ========== HTML 流式注入器 ==========
+// 使用 Transform Stream 实现流式脚本注入，避免缓冲整个 HTML
+class HtmlScriptInjector extends Transform {
+  private scriptToInject: string;
+  private injected: boolean = false;
+  private buffer: string = '';
+
+  constructor(scriptToInject: string) {
+    super();
+    this.scriptToInject = scriptToInject;
+  }
+
+  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+    // 如果已经注入，直接传递数据
+    if (this.injected) {
+      callback(null, chunk);
+      return;
+    }
+
+    // 将 chunk 添加到缓冲区
+    this.buffer += chunk.toString('utf8');
+
+    // 尝试查找 <head> 标签
+    const headOpenRegex = /<head(\s[^>]*)?>|<head>/i;
+    const headMatch = this.buffer.match(headOpenRegex);
+
+    if (headMatch && headMatch.index !== undefined) {
+      // 找到 <head> 标签，注入脚本
+      const insertPos = headMatch.index + headMatch[0].length;
+      const before = this.buffer.slice(0, insertPos);
+      const after = this.buffer.slice(insertPos);
+
+      this.injected = true;
+
+      // 输出：<head> 之前的内容 + <head> 标签 + 注入脚本 + 剩余内容
+      callback(null, Buffer.from(before + this.scriptToInject + after, 'utf8'));
+      this.buffer = '';
+      return;
+    }
+
+    // 检查是否有 </head> 作为备选注入点
+    if (this.buffer.includes('</head>')) {
+      const modifiedHtml = this.buffer.replace('</head>', `${this.scriptToInject}</head>`);
+      this.injected = true;
+      callback(null, Buffer.from(modifiedHtml, 'utf8'));
+      this.buffer = '';
+      return;
+    }
+
+    // 如果缓冲区太大（超过 64KB），可能不是标准 HTML，直接输出
+    if (this.buffer.length > 65536) {
+      this.injected = true; // 放弃注入
+      callback(null, Buffer.from(this.buffer, 'utf8'));
+      this.buffer = '';
+      return;
+    }
+
+    // 继续等待更多数据
+    callback();
+  }
+
+  _flush(callback: TransformCallback): void {
+    // 流结束时，输出剩余缓冲区内容
+    if (this.buffer.length > 0) {
+      callback(null, Buffer.from(this.buffer, 'utf8'));
+    } else {
+      callback();
+    }
+  }
+}
 
 // 从配置导出的浏览器信息常量
 const SPOOFED_USER_AGENT = FINGERPRINT.userAgent;
@@ -825,60 +916,31 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           return;
         }
 
-        // 处理 HTML 响应，注入脚本
-        // 优化：只在主页面注入，跳过 API 返回的 HTML 片段
+        // 处理 HTML 响应，流式注入脚本
+        // 优化：使用 Transform Stream 流式处理，避免缓冲整个 HTML
         if (contentType.includes('text/html') && !reqUrl.startsWith('/api/')) {
-          const chunks: Buffer[] = [];
+          // 准备注入的脚本
+          const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
+          const isAdmin = keyEntry && keyEntry.isAdmin;
+          const adminFlagScript = `<script>window.__PROXY_IS_ADMIN__=${isAdmin ? 'true' : 'false'};</script>`;
+          const scriptToInject = adminFlagScript + INJECT_SCRIPT;
 
-          proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
-          proxyRes.on('end', () => {
-            try {
-              let htmlStr = Buffer.concat(chunks).toString('utf8');
+          // 设置响应头（流式处理无法预知 content-length，使用 chunked 传输）
+          const headers = { ...proxyRes.headers };
+          delete headers['content-length']; // 移除，使用 chunked 编码
+          delete headers['content-encoding']; // 移除压缩编码
 
-              // 只在包含 <head> 标签的完整 HTML 文档中注入
-              // 跳过 HTML 片段（如某些 API 可能返回的）
-              if (!htmlStr.includes('<head')) {
-                // 不是完整 HTML 文档，直接返回
-                const responseBuffer = Buffer.from(htmlStr, 'utf8');
-                const headers = { ...proxyRes.headers };
-                headers['content-length'] = String(responseBuffer.length);
-                (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
-                (res as ServerResponse).end(responseBuffer);
-                return;
-              }
+          (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
 
-              // 所有用户都注入指纹伪装脚本
-              // 通过设置全局变量告知脚本是否为管理员，管理员跳过UI隐藏
-              const keyEntry = (req as RequestWithApiKey).apiKeyEntry;
-              const isAdmin = keyEntry && keyEntry.isAdmin;
-              const adminFlagScript = `<script>window.__PROXY_IS_ADMIN__=${isAdmin ? 'true' : 'false'};</script>`;
-              const scriptToInject = adminFlagScript + INJECT_SCRIPT;
+          // 创建流式注入器并管道连接
+          const injector = new HtmlScriptInjector(scriptToInject);
 
-              // 在 <head> 后立即注入脚本
-              // 注意: 这会导致 React hydration 警告 #418,但不影响功能
-              // React #418 是由于 SSR HTML 和客户端 HTML 不匹配,但这是代理的必要副作用
-              const headOpenRegex = /<head(\s[^>]*)?>|<head>/i;
-              const headMatch = htmlStr.match(headOpenRegex);
-              if (headMatch) {
-                htmlStr = htmlStr.replace(headMatch[0], `${headMatch[0]}${scriptToInject}`);
-              } else if (htmlStr.includes('</head>')) {
-                htmlStr = htmlStr.replace('</head>', `${scriptToInject}</head>`);
-              }
-
-              const responseBuffer = Buffer.from(htmlStr, 'utf8');
-
-              const headers = { ...proxyRes.headers };
-              headers['content-length'] = String(responseBuffer.length);
-              delete headers['content-encoding'];
-
-              (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
-              (res as ServerResponse).end(responseBuffer);
-            } catch (err) {
-              console.error('[Web Proxy] Error processing HTML:', err);
-              (res as ServerResponse).writeHead(500, { 'Content-Type': 'text/plain' });
-              (res as ServerResponse).end('Proxy Error');
-            }
+          injector.on('error', (err) => {
+            console.error('[Web Proxy] HTML stream error:', err);
           });
+
+          proxyRes.pipe(injector).pipe(res as ServerResponse);
+          return;
         }
         // 注意：不需要处理的请求（包括静态资源缓存）已在开头流式转发
       },

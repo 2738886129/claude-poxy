@@ -445,9 +445,11 @@ export function getLoginPageHtml(error?: string): string {
 }
 
 // ===== 管理员页面 HTML =====
-export function getAdminLoginHtml(error?: string): string {
-  const errorMessage = error === 'invalid' ? '密码错误' :
-                       error === 'not_set' ? '管理员密码未设置，请先通过 CLI 设置' : '';
+export function getAdminLoginHtml(message?: string): string {
+  const isSuccess = message === 'password_changed';
+  const displayMessage = message === 'invalid' ? '密码错误' :
+                         message === 'not_set' ? '管理员密码未设置，请先通过 CLI 设置' :
+                         message === 'password_changed' ? '密码修改成功，请使用新密码登录' : '';
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -497,24 +499,22 @@ export function getAdminLoginHtml(error?: string): string {
       cursor: pointer;
     }
     button:hover { opacity: 0.9; }
-    .error-message {
-      background: #fee2e2;
-      color: #dc2626;
+    .message-box {
       padding: 12px;
       border-radius: 8px;
       margin-bottom: 24px;
       text-align: center;
       font-size: 14px;
     }
-    .back-link { text-align: center; margin-top: 16px; }
-    .back-link a { color: #666; text-decoration: none; font-size: 13px; }
+    .message-box.error { background: #fee2e2; color: #dc2626; }
+    .message-box.success { background: #d1fae5; color: #065f46; }
   </style>
 </head>
 <body>
   <div class="login-container">
     <h1>管理员登录</h1>
     <p class="subtitle">请输入管理员密码</p>
-    ${errorMessage ? `<div class="error-message">${errorMessage}</div>` : ''}
+    ${displayMessage ? `<div class="message-box ${isSuccess ? 'success' : 'error'}">${displayMessage}</div>` : ''}
     <form method="POST" action="/login">
       <div class="form-group">
         <label for="password">密码</label>
@@ -522,9 +522,6 @@ export function getAdminLoginHtml(error?: string): string {
       </div>
       <button type="submit">登录</button>
     </form>
-    <div class="back-link">
-      <a href="http://localhost:3000/__proxy__/login">返回用户登录</a>
-    </div>
   </div>
 </body>
 </html>`;
@@ -772,6 +769,29 @@ export function getAdminDashboardHtml(keys: (ApiKeyEntry & { fullKey: string })[
           </tbody>
         </table>
       `}
+    </div>
+
+    <div class="card">
+      <h2>修改管理员密码</h2>
+      <form method="POST" action="/change-password">
+        <div class="form-row">
+          <div class="form-group">
+            <label>当前密码</label>
+            <input type="password" name="current_password" required>
+          </div>
+          <div class="form-group">
+            <label>新密码</label>
+            <input type="password" name="new_password" required minlength="6">
+          </div>
+          <div class="form-group">
+            <label>确认新密码</label>
+            <input type="password" name="confirm_password" required minlength="6">
+          </div>
+          <div class="form-group" style="display:flex;align-items:flex-end;">
+            <button type="submit" class="btn-primary">修改密码</button>
+          </div>
+        </div>
+      </form>
     </div>
   </div>
 

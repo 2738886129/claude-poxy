@@ -472,50 +472,64 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
     on: {
       proxyReq: (proxyReq, req) => {
-        // 设置请求超时
-        proxyReq.setTimeout(120000);
-        // 注入 sessionKey Cookie
-        const existingCookie = proxyReq.getHeader('cookie') as string || '';
-        const newCookie = existingCookie
-          ? `${existingCookie}; sessionKey=${sessionKey}`
-          : `sessionKey=${sessionKey}`;
-        proxyReq.setHeader('cookie', newCookie);
-
-        // 设置正确的 Host
-        proxyReq.setHeader('host', 'claude.ai');
-
-        // 移除可能暴露代理的头
-        proxyReq.removeHeader('x-forwarded-host');
-        proxyReq.removeHeader('x-forwarded-proto');
-        proxyReq.removeHeader('x-forwarded-for');
-        proxyReq.removeHeader('x-real-ip');
-        proxyReq.removeHeader('x-client-ip');
-        proxyReq.removeHeader('cf-connecting-ip');
-        proxyReq.removeHeader('true-client-ip');
-        proxyReq.removeHeader('via');
-
-        // 覆盖客户端浏览器指纹相关的请求头
-        proxyReq.setHeader('user-agent', SPOOFED_USER_AGENT);
-        proxyReq.setHeader('accept-language', SPOOFED_ACCEPT_LANGUAGE);
-        proxyReq.setHeader('sec-ch-ua', SPOOFED_SEC_CH_UA);
-        proxyReq.setHeader('sec-ch-ua-platform', SPOOFED_SEC_CH_UA_PLATFORM);
-        proxyReq.setHeader('sec-ch-ua-mobile', SPOOFED_SEC_CH_UA_MOBILE);
-
-        // 修正 referer 和 origin，避免暴露代理地址
-        const referer = proxyReq.getHeader('referer') as string;
-        if (referer) {
-          proxyReq.setHeader('referer', referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai'));
-        }
-        const origin = proxyReq.getHeader('origin') as string;
-        if (origin && !origin.includes('claude.ai')) {
-          proxyReq.setHeader('origin', 'https://claude.ai');
+        // 防止在头部已发送后修改，避免 ERR_HTTP_HEADERS_SENT 错误
+        if (proxyReq.headersSent) {
+          console.warn(`[Web Proxy] Headers already sent, skipping modification for ${req.url}`);
+          return;
         }
 
-        // 请求未压缩的响应
-        // 注意：压缩透传在某些环境下不兼容，暂时禁用
-        proxyReq.setHeader('accept-encoding', 'identity');
+        try {
+          // 设置请求超时
+          proxyReq.setTimeout(120000);
+          // 注入 sessionKey Cookie
+          const existingCookie = proxyReq.getHeader('cookie') as string || '';
+          const newCookie = existingCookie
+            ? `${existingCookie}; sessionKey=${sessionKey}`
+            : `sessionKey=${sessionKey}`;
+          proxyReq.setHeader('cookie', newCookie);
 
-        console.log(`[Web Proxy] ${req.method} ${req.url}`);
+          // 设置正确的 Host
+          proxyReq.setHeader('host', 'claude.ai');
+
+          // 移除可能暴露代理的头
+          proxyReq.removeHeader('x-forwarded-host');
+          proxyReq.removeHeader('x-forwarded-proto');
+          proxyReq.removeHeader('x-forwarded-for');
+          proxyReq.removeHeader('x-real-ip');
+          proxyReq.removeHeader('x-client-ip');
+          proxyReq.removeHeader('cf-connecting-ip');
+          proxyReq.removeHeader('true-client-ip');
+          proxyReq.removeHeader('via');
+
+          // 覆盖客户端浏览器指纹相关的请求头
+          proxyReq.setHeader('user-agent', SPOOFED_USER_AGENT);
+          proxyReq.setHeader('accept-language', SPOOFED_ACCEPT_LANGUAGE);
+          proxyReq.setHeader('sec-ch-ua', SPOOFED_SEC_CH_UA);
+          proxyReq.setHeader('sec-ch-ua-platform', SPOOFED_SEC_CH_UA_PLATFORM);
+          proxyReq.setHeader('sec-ch-ua-mobile', SPOOFED_SEC_CH_UA_MOBILE);
+
+          // 修正 referer 和 origin，避免暴露代理地址
+          const referer = proxyReq.getHeader('referer') as string;
+          if (referer) {
+            proxyReq.setHeader('referer', referer.replace(/^https?:\/\/[^/]+/, 'https://claude.ai'));
+          }
+          const origin = proxyReq.getHeader('origin') as string;
+          if (origin && !origin.includes('claude.ai')) {
+            proxyReq.setHeader('origin', 'https://claude.ai');
+          }
+
+          // 请求未压缩的响应
+          // 注意：压缩透传在某些环境下不兼容，暂时禁用
+          proxyReq.setHeader('accept-encoding', 'identity');
+
+          console.log(`[Web Proxy] ${req.method} ${req.url}`);
+        } catch (err: any) {
+          if (err.code === 'ERR_HTTP_HEADERS_SENT') {
+            console.warn(`[Web Proxy] Headers already sent for ${req.url}, ignoring`);
+            return;
+          }
+          throw err;
+        }
       },
 
       proxyRes: (proxyRes, req, res) => {

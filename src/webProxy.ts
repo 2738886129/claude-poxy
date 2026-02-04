@@ -472,9 +472,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
     on: {
       proxyReq: (proxyReq, req) => {
-        // 防止在头部已发送后修改，避免 ERR_HTTP_HEADERS_SENT 错误
-        if (proxyReq.headersSent) {
-          console.warn(`[Web Proxy] Headers already sent, skipping modification for ${req.url}`);
+        // 添加保护：检查请求状态，避免在已发送头部后修改
+        const isFinished = (proxyReq as any).finished;
+        const isHeadersSent = (proxyReq as any).headersSent;
+
+        if (isFinished || isHeadersSent) {
+          console.warn(`[Web Proxy] Skipping header modification for ${req.url} (finished: ${isFinished}, headersSent: ${isHeadersSent})`);
           return;
         }
 
@@ -524,11 +527,12 @@ export function createWebProxy(sessionKey: string): RequestHandler {
 
           console.log(`[Web Proxy] ${req.method} ${req.url}`);
         } catch (err: any) {
+          // 忽略 ERR_HTTP_HEADERS_SENT 错误，这在某些竞态条件下可能发生
           if (err.code === 'ERR_HTTP_HEADERS_SENT') {
             console.warn(`[Web Proxy] Headers already sent for ${req.url}, ignoring`);
             return;
           }
-          throw err;
+          console.error(`[Web Proxy] Error in proxyReq handler:`, err.message);
         }
       },
 

@@ -3,7 +3,7 @@ import type { RequestHandler, Request } from 'express';
 import type { ServerResponse } from 'http';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getCache } from './staticCache.js';
+// import { getCache } from './staticCache.js'; // 缓存已禁用
 import type { ApiKeyEntry } from './auth.js';
 import https from 'https';
 
@@ -367,32 +367,8 @@ function filterList(data: unknown, allowedIds: string[]): unknown {
 }
 
 export function createWebProxy(sessionKey: string): RequestHandler {
-  const cache = getCache();
-
-  // 创建一个中间件来处理缓存
-  const cacheMiddleware: RequestHandler = (req, res, next) => {
-    const url = req.url || '';
-    const method = req.method || 'GET';
-
-    // 检查是否可缓存且有缓存
-    if (cache.isCacheable(url, method)) {
-      const cached = cache.get(url);
-      if (cached) {
-        console.log(`[Cache] HIT: ${url}`);
-
-        // 设置响应头
-        res.status(cached.entry.statusCode);
-        for (const [key, value] of Object.entries(cached.entry.headers)) {
-          res.setHeader(key, value);
-        }
-        res.setHeader('x-cache', 'HIT');
-        res.send(cached.data);
-        return;
-      }
-    }
-
-    next();
-  };
+  // 缓存功能已禁用，改用压缩透传优化
+  // const cache = getCache();
 
   const proxyMiddleware = createProxyMiddleware({
     target: CLAUDE_WEB_URL,
@@ -444,7 +420,8 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           proxyReq.setHeader('origin', 'https://claude.ai');
         }
 
-        // 请求未压缩的响应，便于修改
+        // 请求未压缩的响应
+        // 注意：压缩透传在某些环境下不兼容，暂时禁用
         proxyReq.setHeader('accept-encoding', 'identity');
 
         console.log(`[Web Proxy] ${req.method} ${req.url}`);
@@ -482,37 +459,8 @@ export function createWebProxy(sessionKey: string): RequestHandler {
           // 2. HTML 页面（需要注入脚本）
           contentType.includes('text/html');
 
-        // 如果不需要拦截，直接流式转发
+        // 如果不需要拦截，直接流式转发（压缩内容直接透传）
         if (!needsInterception) {
-          // 对于可缓存的静态资源，仍然缓存
-          if (cache.isCacheable(reqUrl, reqMethod)) {
-            const chunks: Buffer[] = [];
-            proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
-            proxyRes.on('end', () => {
-              const responseBuffer = Buffer.concat(chunks);
-              const statusCode = proxyRes.statusCode || 200;
-
-              if (statusCode >= 200 && statusCode < 300) {
-                const headersToCache: Record<string, string> = {};
-                for (const [key, value] of Object.entries(proxyRes.headers)) {
-                  if (value && typeof value === 'string') {
-                    headersToCache[key] = value;
-                  } else if (Array.isArray(value)) {
-                    headersToCache[key] = value.join(', ');
-                  }
-                }
-                cache.set(reqUrl, responseBuffer, statusCode, contentType, headersToCache);
-              }
-
-              const headers = { ...proxyRes.headers };
-              headers['x-cache'] = 'MISS';
-              (res as ServerResponse).writeHead(statusCode, headers);
-              (res as ServerResponse).end(responseBuffer);
-            });
-            return;
-          }
-
-          // 其他不需要缓存的内容：直接流式转发（最快路径）
           console.log('[Web Proxy] 流式转发:', reqMethod, reqUrl);
           (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
           proxyRes.pipe(res as ServerResponse);
@@ -939,10 +887,6 @@ export function createWebProxy(sessionKey: string): RequestHandler {
     }
   });
 
-  // 返回组合的中间件：先检查缓存，再代理
-  return (req, res, next) => {
-    cacheMiddleware(req, res, () => {
-      proxyMiddleware(req, res, next);
-    });
-  };
+  // 直接返回代理中间件（缓存已禁用）
+  return proxyMiddleware;
 }

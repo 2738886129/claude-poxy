@@ -34,7 +34,8 @@
       "Bash(dir:*)",
       "Bash(tasklist:*)",
       "Bash(curl -s \"http://10.143.202.249:3001/__proxy__/inject.js\")",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(wc:*)"
     ]
   }
 }

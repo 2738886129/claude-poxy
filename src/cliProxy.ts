@@ -55,10 +55,18 @@ function extractMessageContent(msg: Message): string {
 }
 
 // 将所有 messages 转换为对话格式
-function formatConversation(messages: Message[]): string {
+// maxMessages: 最多保留多少条消息（0 = 无限制）
+function formatConversation(messages: Message[], maxMessages: number = 6): string {
+  // 限制历史消息数量，避免上下文超限
+  let messagesToProcess = messages;
+  if (maxMessages > 0 && messages.length > maxMessages) {
+    console.log(`[CLI Proxy] 限制消息数量: ${messages.length} -> ${maxMessages}`);
+    messagesToProcess = messages.slice(-maxMessages);
+  }
+
   const parts: string[] = [];
 
-  for (const msg of messages) {
+  for (const msg of messagesToProcess) {
     const content = extractMessageContent(msg);
     if (!content) continue;
 
@@ -177,6 +185,12 @@ class ClaudeProcessPool {
   private async warmupProcess(): Promise<void> {
     // 预启动一个进程，发送一个简单请求让它初始化
     return new Promise((resolve) => {
+      // 清除代理相关的环境变量，防止 claude CLI 自己也指向代理造成循环
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.ANTHROPIC_API_KEY;
+      delete cleanEnv.ANTHROPIC_BASE_URL;
+      cleanEnv.LANG = 'en_US.UTF-8';
+
       const proc = spawn('claude', [
         '--print',
         '--output-format', 'text',
@@ -184,7 +198,7 @@ class ClaudeProcessPool {
       ], {
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,
-        env: { ...process.env, LANG: 'en_US.UTF-8' }
+        env: cleanEnv
       });
 
       // 发送一个简单的 warmup 请求
@@ -211,6 +225,12 @@ class ClaudeProcessPool {
     onClose: (code: number | null) => void,
     onError: (err: Error) => void
   ): ChildProcess {
+    // 清除代理相关的环境变量，防止 claude CLI 自己也指向代理造成循环
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.ANTHROPIC_API_KEY;
+    delete cleanEnv.ANTHROPIC_BASE_URL;
+    cleanEnv.LANG = 'en_US.UTF-8';
+
     const proc = spawn('claude', [
       '--print',
       '--output-format', 'stream-json',
@@ -219,7 +239,7 @@ class ClaudeProcessPool {
     ], {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
-      env: { ...process.env, LANG: 'en_US.UTF-8' }
+      env: cleanEnv
     });
 
     let buffer = '';
@@ -279,6 +299,12 @@ class ClaudeProcessPool {
     onClose: (code: number | null) => void,
     onError: (err: Error) => void
   ): ChildProcess {
+    // 清除代理相关的环境变量，防止 claude CLI 自己也指向代理造成循环
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.ANTHROPIC_API_KEY;
+    delete cleanEnv.ANTHROPIC_BASE_URL;
+    cleanEnv.LANG = 'en_US.UTF-8';
+
     const proc = spawn('claude', [
       '--print',
       '--output-format', 'text',
@@ -286,7 +312,7 @@ class ClaudeProcessPool {
     ], {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
-      env: { ...process.env, LANG: 'en_US.UTF-8' }
+      env: cleanEnv
     });
 
     proc.stdout.on('data', (data: Buffer) => {

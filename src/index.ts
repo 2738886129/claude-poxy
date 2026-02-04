@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createWebProxy, FINGERPRINT } from './webProxy.js';
-import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
+// import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
 import {
   createAuthMiddleware,
@@ -904,12 +904,10 @@ app.post('/__proxy__/cache/clear', (_req, res) => {
   res.json({ success: true, message: '缓存已清空' });
 });
 
-// Claude Code API 代理 - 通过本机 CLI 处理
-// /v1/messages - 主要的聊天接口
-app.post('/v1/messages', createAuthMiddleware(), createCliProxy());
-
-// /v1/messages/count_tokens - token 计数（返回假数据）
-app.post('/v1/messages/count_tokens', createAuthMiddleware(), createTokenCountHandler());
+// Claude Code API 代理 - 已禁用
+// 如需启用，取消下面两行的注释
+// app.post('/v1/messages', createAuthMiddleware(), createCliProxy());
+// app.post('/v1/messages/count_tokens', createAuthMiddleware(), createTokenCountHandler());
 
 // 启动服务器
 const mainServer = app.listen(PORT, '0.0.0.0', () => {

@@ -239,13 +239,19 @@ function extractApiKey(req: Request): string | null {
     return authHeader;
   }
 
-  // 2. 从 X-Proxy-Key header 提取
+  // 2. 从 X-API-Key header 提取 (Claude Code 使用此 header)
+  const apiKeyHeader = req.headers['x-api-key'];
+  if (apiKeyHeader && typeof apiKeyHeader === 'string') {
+    return apiKeyHeader;
+  }
+
+  // 3. 从 X-Proxy-Key header 提取
   const proxyKey = req.headers['x-proxy-key'];
   if (proxyKey && typeof proxyKey === 'string') {
     return proxyKey;
   }
 
-  // 3. 从 Cookie 提取
+  // 4. 从 Cookie 提取
   const cookies = req.headers.cookie;
   if (cookies) {
     const match = cookies.match(/proxy_key=([^;]+)/);

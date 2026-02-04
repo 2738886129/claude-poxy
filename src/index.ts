@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createWebProxy, FINGERPRINT } from './webProxy.js';
+import { createOptimizedWebProxy } from './webProxy.optimized.js';
 // import { createCliProxy, createTokenCountHandler } from './cliProxy.js';
 import { getCache } from './staticCache.js';
 import {
@@ -98,7 +99,8 @@ app.get('/__proxy__/logout', (_req, res) => {
 // 否则 POST 请求的 body 会被消费，导致代理无法正确转发
 if (SESSION_KEY) {
   // 创建一次代理实例并复用，避免内存泄漏警告
-  const webProxy = createWebProxy(SESSION_KEY);
+  // 使用优化版本的代理（双代理策略：流式转发 + 选择性拦截）
+  const webProxy = createOptimizedWebProxy(SESSION_KEY, createWebProxy);
   const authMiddleware = createAuthMiddleware();
 
   // 排除 CLI API 路径和内部路径

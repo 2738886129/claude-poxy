@@ -123,12 +123,18 @@ export function createOptimizedWebProxy(
         delete proxyRes.headers['content-security-policy'];
         delete proxyRes.headers['content-security-policy-report-only'];
 
-        // 修改 Set-Cookie 的域名
+        // 修改 Set-Cookie：移除域名，并过滤掉 sessionKey（防止泄露真实 session token）
         const setCookie = proxyRes.headers['set-cookie'];
         if (setCookie) {
-          proxyRes.headers['set-cookie'] = setCookie.map(cookie =>
-            cookie.replace(/domain=[^;]+;?/gi, '')
-          );
+          const filteredCookies = setCookie
+            .filter(cookie => !cookie.toLowerCase().startsWith('sessionkey='))
+            .map(cookie => cookie.replace(/domain=[^;]+;?/gi, ''));
+
+          if (filteredCookies.length > 0) {
+            proxyRes.headers['set-cookie'] = filteredCookies;
+          } else {
+            delete proxyRes.headers['set-cookie'];
+          }
         }
       },
 

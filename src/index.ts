@@ -77,54 +77,8 @@ app.get('/__proxy__/logout', (_req, res) => {
   res.redirect('/__proxy__/login');
 });
 
-// Web 代理必须在 express.json() 之前挂载
-// 否则 POST 请求的 body 会被消费，导致代理无法正确转发
-if (SESSION_KEY) {
-  // 创建一次代理实例并复用，避免内存泄漏警告
-  // 使用优化版本的代理（双代理策略：流式转发 + 选择性拦截）
-  const webProxy = createOptimizedWebProxy(SESSION_KEY, createWebProxy);
-  const authMiddleware = createAuthMiddleware();
-
-  // 排除 CLI API 路径和内部路径
-  app.use((req, res, next) => {
-    const path = req.path;
-    // 这些路径需要 express.json() 处理，跳过 Web 代理
-    if (path.startsWith('/v1/') || path.startsWith('/__proxy__/')) {
-      return next();
-    }
-
-    // 拦截第三方服务请求（Sentry 错误上报、Intercom 客服等）
-    // 这些服务对 Claude 核心功能无影响，拦截可减少控制台噪音
-    const blockedDomains = [
-      'sentry.io',           // Sentry 错误追踪
-      'api-iam.intercom.io', // Intercom 客服聊天
-      'intercom.io'          // Intercom 相关
-    ];
-
-    const referer = req.get('referer') || '';
-    const host = req.get('host') || '';
-
-    // 检查是否是到被阻止域名的请求
-    if (blockedDomains.some(domain =>
-        referer.includes(domain) ||
-        host.includes(domain) ||
-        path.includes(domain)
-    )) {
-      // 返回空响应，避免控制台错误
-      return res.status(204).end();
-    }
-
-    // 先验证认证，再走 Web 代理
-    authMiddleware(req, res, (err?: any) => {
-      if (err) return next(err);
-      return webProxy(req, res, next);
-    });
-  });
-}
-
-// Anthropic API 通用代理 - 解决 CORS 问题
-// 前端需要访问 api.anthropic.com 的各种 API，但会遇到 CORS 限制
-// 通过代理服务器转发这些请求（支持 MCP Registry、模型配置等）
+// ========== Anthropic API 代理（必须在 Web 代理之前）==========
+// 解决 CORS 问题：前端需要访问 api.anthropic.com 的各种 API
 import https from 'https';
 
 // 创建通用的 API 代理处理函数
@@ -187,6 +141,51 @@ app.options(['/mcp-registry/*', '/v1/*'], (_req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.status(204).end();
 });
+
+// Web 代理必须在 express.json() 之前挂载
+// 否则 POST 请求的 body 会被消费，导致代理无法正确转发
+if (SESSION_KEY) {
+  // 创建一次代理实例并复用，避免内存泄漏警告
+  // 使用优化版本的代理（双代理策略：流式转发 + 选择性拦截）
+  const webProxy = createOptimizedWebProxy(SESSION_KEY, createWebProxy);
+  const authMiddleware = createAuthMiddleware();
+
+  // 排除内部路径
+  app.use((req, res, next) => {
+    const path = req.path;
+    // 这些路径由其他中间件处理，跳过 Web 代理
+    if (path.startsWith('/__proxy__/') || path.startsWith('/mcp-registry/') || path.startsWith('/v1/')) {
+      return next();
+    }
+
+    // 拦截第三方服务请求（Sentry 错误上报、Intercom 客服等）
+    // 这些服务对 Claude 核心功能无影响，拦截可减少控制台噪音
+    const blockedDomains = [
+      'sentry.io',           // Sentry 错误追踪
+      'api-iam.intercom.io', // Intercom 客服聊天
+      'intercom.io'          // Intercom 相关
+    ];
+
+    const referer = req.get('referer') || '';
+    const host = req.get('host') || '';
+
+    // 检查是否是到被阻止域名的请求
+    if (blockedDomains.some(domain =>
+        referer.includes(domain) ||
+        host.includes(domain) ||
+        path.includes(domain)
+    )) {
+      // 返回空响应，避免控制台错误
+      return res.status(204).end();
+    }
+
+    // 先验证认证，再走 Web 代理
+    authMiddleware(req, res, (err?: any) => {
+      if (err) return next(err);
+      return webProxy(req, res, next);
+    });
+  });
+}
 
 // 提供自定义注入脚本
 app.get('/__proxy__/inject.js', (_req, res) => {

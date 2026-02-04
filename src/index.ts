@@ -122,6 +122,57 @@ if (SESSION_KEY) {
   });
 }
 
+// MCP Registry API 代理 - 解决 CORS 问题
+// 前端需要访问 api.anthropic.com/mcp-registry，但会遇到 CORS 限制
+// 通过代理服务器转发这些请求
+import https from 'https';
+
+app.get('/mcp-registry/*', (req, res) => {
+  const path = req.path; // 例如：/mcp-registry/v0/servers
+  const queryString = Object.keys(req.query).length > 0
+    ? '?' + new URLSearchParams(req.query as Record<string, string>).toString()
+    : '';
+  const fullPath = `${path}${queryString}`;
+
+  console.log(`[MCP Registry Proxy] 转发请求: https://api.anthropic.com${fullPath}`);
+
+  const options = {
+    hostname: 'api.anthropic.com',
+    path: fullPath,
+    method: req.method,
+    headers: {
+      'User-Agent': 'Claude-Proxy/1.0',
+      'Accept': 'application/json',
+    }
+  };
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    // 设置 CORS 头，允许前端访问
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'application/json');
+
+    res.status(proxyRes.statusCode || 200);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('[MCP Registry Proxy] 错误:', err.message);
+    res.status(500).json({ error: 'MCP Registry proxy error', message: err.message });
+  });
+
+  proxyReq.end();
+});
+
+// OPTIONS 预检请求
+app.options('/mcp-registry/*', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
 // 提供自定义注入脚本
 app.get('/__proxy__/inject.js', (_req, res) => {
   // 禁用缓存，确保每次都获取最新脚本
@@ -166,6 +217,9 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         timezone: FINGERPRINT.timezone
       })};
 
+      // 保存原始的 clipboard API（修复剪贴板功能）
+      const originalClipboard = navigator.clipboard;
+
       // 伪装 navigator 属性
       const navigatorProps = {
         userAgent: { get: () => SPOOFED.userAgent },
@@ -184,6 +238,18 @@ app.get('/__proxy__/inject.js', (_req, res) => {
         try {
           Object.defineProperty(navigator, prop, { ...descriptor, configurable: true });
         } catch (e) {}
+      }
+
+      // 恢复 clipboard API（确保剪贴板功能正常工作）
+      if (originalClipboard) {
+        try {
+          Object.defineProperty(navigator, 'clipboard', {
+            get: () => originalClipboard,
+            configurable: true
+          });
+        } catch (e) {
+          console.warn('[Proxy] 无法恢复 clipboard API:', e);
+        }
       }
 
       // 伪装 screen 属性

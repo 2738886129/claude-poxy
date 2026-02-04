@@ -5,8 +5,20 @@ import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { getCache } from './staticCache.js';
 import type { ApiKeyEntry } from './auth.js';
+import https from 'https';
 
 const CLAUDE_WEB_URL = 'https://claude.ai';
+
+// 创建共享的 HTTPS Agent，启用 Keep-Alive
+// 这可以显著提升性能，复用 TCP 连接
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 256,
+  maxFreeSockets: 256,
+  timeout: 120000,
+  scheduling: 'lifo' // 后进先出，提高热连接复用率
+});
 
 // 指纹配置接口
 interface FingerprintConfig {
@@ -387,6 +399,7 @@ export function createWebProxy(sessionKey: string): RequestHandler {
     changeOrigin: true,
     secure: true,
     selfHandleResponse: true,
+    agent: httpsAgent, // 使用 Keep-Alive Agent 提升性能
     proxyTimeout: 120000, // 2分钟超时
     timeout: 120000,
 
@@ -453,6 +466,59 @@ export function createWebProxy(sessionKey: string): RequestHandler {
         const contentType = proxyRes.headers['content-type'] || '';
         const reqUrl = req.url || '';
         const reqMethod = req.method || 'GET';
+
+        // ========== 性能优化：提前识别不需要处理的请求，直接流式转发 ==========
+        // 这是最关键的优化：大部分请求（90%+）都不需要缓冲处理
+        const needsInterception =
+          // 1. 需要拦截的 API
+          isChatListApi(reqUrl, reqMethod) ||
+          isProjectListApi(reqUrl) ||
+          isSearchApi(reqUrl) ||
+          isChatCountApi(reqUrl) ||
+          isCreateChatApi(reqUrl, reqMethod) ||
+          isCreateProjectApi(reqUrl, reqMethod) ||
+          isDeleteChatApi(reqUrl, reqMethod).isDelete ||
+          isDeleteProjectApi(reqUrl, reqMethod).isDelete ||
+          // 2. HTML 页面（需要注入脚本）
+          contentType.includes('text/html');
+
+        // 如果不需要拦截，直接流式转发
+        if (!needsInterception) {
+          // 对于可缓存的静态资源，仍然缓存
+          if (cache.isCacheable(reqUrl, reqMethod)) {
+            const chunks: Buffer[] = [];
+            proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+            proxyRes.on('end', () => {
+              const responseBuffer = Buffer.concat(chunks);
+              const statusCode = proxyRes.statusCode || 200;
+
+              if (statusCode >= 200 && statusCode < 300) {
+                const headersToCache: Record<string, string> = {};
+                for (const [key, value] of Object.entries(proxyRes.headers)) {
+                  if (value && typeof value === 'string') {
+                    headersToCache[key] = value;
+                  } else if (Array.isArray(value)) {
+                    headersToCache[key] = value.join(', ');
+                  }
+                }
+                cache.set(reqUrl, responseBuffer, statusCode, contentType, headersToCache);
+              }
+
+              const headers = { ...proxyRes.headers };
+              headers['x-cache'] = 'MISS';
+              (res as ServerResponse).writeHead(statusCode, headers);
+              (res as ServerResponse).end(responseBuffer);
+            });
+            return;
+          }
+
+          // 其他不需要缓存的内容：直接流式转发（最快路径）
+          console.log('[Web Proxy] 流式转发:', reqMethod, reqUrl);
+          (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+          proxyRes.pipe(res as ServerResponse);
+          return;
+        }
+        // ========== 以下是需要拦截处理的请求 ==========
 
         // 处理删除对话 API - 从允许列表移除(仅非管理员)
         const deleteChat = isDeleteChatApi(reqUrl, reqMethod);
@@ -806,13 +872,26 @@ export function createWebProxy(sessionKey: string): RequestHandler {
         }
 
         // 处理 HTML 响应，注入脚本
-        if (contentType.includes('text/html')) {
+        // 优化：只在主页面注入，跳过 API 返回的 HTML 片段
+        if (contentType.includes('text/html') && !reqUrl.startsWith('/api/')) {
           const chunks: Buffer[] = [];
 
           proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
           proxyRes.on('end', () => {
             try {
               let htmlStr = Buffer.concat(chunks).toString('utf8');
+
+              // 只在包含 <head> 标签的完整 HTML 文档中注入
+              // 跳过 HTML 片段（如某些 API 可能返回的）
+              if (!htmlStr.includes('<head')) {
+                // 不是完整 HTML 文档，直接返回
+                const responseBuffer = Buffer.from(htmlStr, 'utf8');
+                const headers = { ...proxyRes.headers };
+                headers['content-length'] = String(responseBuffer.length);
+                (res as ServerResponse).writeHead(proxyRes.statusCode || 200, headers);
+                (res as ServerResponse).end(responseBuffer);
+                return;
+              }
 
               // 所有用户都注入指纹伪装脚本
               // 通过设置全局变量告知脚本是否为管理员，管理员跳过UI隐藏
@@ -846,46 +925,8 @@ export function createWebProxy(sessionKey: string): RequestHandler {
               (res as ServerResponse).end('Proxy Error');
             }
           });
-        } else if (cache.isCacheable(reqUrl, req.method || 'GET')) {
-          // 可缓存的静态资源 - 收集响应并缓存
-          const chunks: Buffer[] = [];
-
-          proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
-          proxyRes.on('end', () => {
-            try {
-              const responseBuffer = Buffer.concat(chunks);
-              const statusCode = proxyRes.statusCode || 200;
-
-              // 只缓存成功的响应
-              if (statusCode >= 200 && statusCode < 300) {
-                const headersToCache: Record<string, string> = {};
-                for (const [key, value] of Object.entries(proxyRes.headers)) {
-                  if (value && typeof value === 'string') {
-                    headersToCache[key] = value;
-                  } else if (Array.isArray(value)) {
-                    headersToCache[key] = value.join(', ');
-                  }
-                }
-                cache.set(reqUrl, responseBuffer, statusCode, contentType, headersToCache);
-              }
-
-              const headers = { ...proxyRes.headers };
-              headers['x-cache'] = 'MISS';
-
-              (res as ServerResponse).writeHead(statusCode, headers);
-              (res as ServerResponse).end(responseBuffer);
-            } catch (err) {
-              console.error('[Web Proxy] Error caching response:', err);
-              (res as ServerResponse).writeHead(500, { 'Content-Type': 'text/plain' });
-              (res as ServerResponse).end('Proxy Error');
-            }
-          });
-        } else {
-          // 其他内容直接转发
-          console.log('[Web Proxy] 直接转发:', reqMethod, reqUrl, 'Content-Type:', contentType);
-          (res as ServerResponse).writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-          proxyRes.pipe(res as ServerResponse);
         }
+        // 注意：不需要处理的请求（包括静态资源缓存）已在开头流式转发
       },
 
       error: (err, _req, res) => {
